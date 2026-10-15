@@ -304,9 +304,24 @@ SHA-256: a2fd9854d1f8fd6cf166ae255201fafb8746c0bafe2c697520a89948e5bcd5b8
   → 20 + 86 = 106. Same method (and same result) as the S24 FE port.
   Confirm live with
   `cat /sys/kernel/tracing/events/sched/sched_blocked_reason/id`.
-- `SLIDE_PSELECT_WORD_SHIFT = 0` — payload-internal, not firmware-derivable
-  offline. Must be validated against target `pselect6`/`do_pselect` disassembly
-  and the runtime waiter-offset check before any real run.
+- `SLIDE_PSELECT_WORD_SHIFT = 5` — VERIFIED by frame-sum derivation
+  (write-window analysis `phase2-ww/write-window-analysis.md`,
+  adversarially verified in `phase2-ww/verify/verification.md`):
+  pselect chain writes `stack_fds[0]` at E−0x260, futex chain reads
+  `&rt_waiter` at E−0x238; gap 0x28 = 5 qwords → shift 5 (waiter qword 0
+  = first qword of the write set). Method cross-checked against the
+  hardware-confirmed S24U convention (their gap 0x18 = 3 qwords
+  reproduces their confirmed shift 3). Applied together with the layout
+  fix: A55 BTF `rt_mutex_waiter` is the compact 11-qword layout (tree
+  0x00, pi tree 0x18, task 0x30, lock 0x38, wake_state 0x40, prio 0x44,
+  deadline 0x48, ww_ctx 0x50, size 0x58; kernel write/read sites
+  cross-checked), so `COMPACT_RT_MUTEX_WAITER 1` + the dm3q compact
+  `FAKE_WAITER_*` set replace the wrong 14-qword legacy set. Waiter
+  words 0-9 land on g5-g14; ww_ctx (g15) is intentionally unplaced
+  (the `cannot place ww_ctx` warning is expected — ww_ctx must stay
+  NULL for a futex waiter). Campaign evidence: 5 deep runs, 0/5 windows
+  (window=0) at shift 0 with the legacy branch compiled — the miss
+  signature that motivated this fix.
 
 Nothing here proves the module loads on the A55; all gates are offline checks
 against the recovered vmlinux.elf and the extracted config. Treat the
