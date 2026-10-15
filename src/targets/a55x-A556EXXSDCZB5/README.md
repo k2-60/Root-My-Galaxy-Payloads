@@ -72,3 +72,26 @@ so the exploit's ashmem fd dispatches through the real `ashmem_*` functions
 above — NOT the shim. The shim serves the `memfd_create` path; the runtime
 check is `is_ashmem_file` @ `ffffffc008cc83c0`. No shim functions are mapped
 into the fops macros.
+
+## Wake-mechanism fix (campaign 7 finding)
+
+The pselect route's write-window condition (`slide_stack_write_window =
+ret > 0 && sched_ok`, slide_app.c) is STRUCTURALLY UNSATISFIABLE in this
+build: under `SLIDE_PSELECT_WORD_SHIFT 5` the pselect read set is all-zero
+(the watched fds are unarmed timerfd dups), so pselect always runs to its
+full 100 ms timeout and returns 0 — no `ret > 0` window can ever open.
+Wake-analysis (`phase2-ww/wake/`) plus field-campaign deep runs confirm:
+4/4 deep runs, `pselect_ret=0` (full timeout), `window=0` every time.
+
+The stack premise itself is verified on-stack: the pselect out-set lands at
+E−0x238 = the `rt_waiter` base the futex chain reads, so the write reaches
+the waiter words when it fires — the failure is purely the trigger
+condition, not the placement.
+
+Fix: `APP_ACCEPT_SCHED_TRIGGER 1` (added to `target.h` with the other app
+defines) switches route acceptance to `(waiter_ok && sched_ok)`, dropping
+the unsatisfiable `ret > 0` term. This is the e1s (S24) acceptance path,
+hardware-validated there (done=1 root=1) and shipped by the e1s-DZE1/DZF3,
+e2s and r12s targets. On failure the route degrades to reclaim-miss retries
+as before (no hard abort); the P0 oracle gate write is still verified by
+`verify_p0_pipe_oracle_gate()` readback.
