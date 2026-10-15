@@ -195,6 +195,9 @@ void run_main_route_threads(void) {
 static pid_t spawn_allocation_keeper(void) {
   pid_t child = SYSCHK(fork());
   if (child != 0) {
+    /* the keeper already holds every fd — the atexit holder must not
+     * double-spawn (pipe_exit_disarm_and_hold checks this) */
+    pipe_exit_note_holder();
     return child;
   }
 

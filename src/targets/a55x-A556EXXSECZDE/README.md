@@ -256,3 +256,136 @@ per-variant kernel-binary evidence (same method as this retarget).
   validation run is still the open item, and CZDE adds no new risk.
 - The retargeted profile has had NO device run yet (the device is on CZDE
   since the OTA; the payload above is the first CZDE-matched build).
+
+## Fix-wave: exit-path protection + PR #303 tuning (2026-10-15)
+
+### Field evidence driving this wave
+
+- Shizuku (uid 2000) leak stage PASSED for the first time on CZDE —
+  deepest run: oracle prepared → mm leak ×2 → page-prepare retries →
+  kaslr leak failed — while app-context stayed 0/9.
+- `[ksdiag]` proved `app_hashsize == kernel_hashsize == 2048` (the
+  model-mismatch theory is dead; the runtime hashsize read is correct).
+- Device resets (3× download mode) strike around process-exit/teardown
+  moments.
+
+### a10636d (KernelSnitch/pipe-leak engine fix) — ALREADY PRESENT
+
+Audited our tree against upstream commit a10636d before applying: every
+semantic is already in `src/` in evolved form, so the patch does NOT
+apply cleanly and must NOT be re-applied:
+
+- baseline = MIN-of-8: ours is the generalized quantile form —
+  `KERNELSNITCH_BASELINE_SAMPLES 8`, qsort, `KERNELSNITCH_BASELINE_QUANTILE
+  0` (= MIN) (`src/kernelsnitch/kernelsnitch.h:432`).
+- collision confirmations un-gated: ours was already un-gated with target
+  value **5** (stricter than the patch's 3) (`target.h:50`,
+  `kernelsnitch.h:421`).
+- `prepare_pipe_buffer_page` failure paths: `pr_warning` + full ctx
+  memfd/storage cleanup + `return 0`, and child-did-not-report-base →
+  `base = 0` (`src/pipe.c:207/217/289`) — byte-equivalent to the patch.
+- `PIPE_FIRST_LEAK_ATTEMPTS 12` retry loop with `reset_pipe_attempt()` +
+  `is_direct_ptr` break (`src/fops.c:500`) — identical to the patch; the
+  field log line "page-prepare retries" is this loop working.
+
+### Exit-path fix (MHL ghostlock-a17 pattern) — NEW
+
+Anti-download-mode fix for the exit-teardown panic class: forged
+pipe_buffer slots (`ops == anon_pipe_buf_ops`, `page` = stolen direct-map
+page) hit `anon_pipe_buf_release` → `__folio_put` on reserved pages →
+`bad_page` → panic when the attempt process exits. Mapped from MHL's
+`wq_umh_disarm_atexit` (`ghostlock src/core/main.c:2615`): their ring
+disarm = `rwf_disarm_forged_slots`; their fork-hold = the "g4hold" child.
+Two layers in `src/pipe.c` (new section "exit-path protection"):
+
+- **ring disarm** — `pipe_exit_disarm_forged_slots()`: while the
+  ashmem/configfs alias is live (liveness-probe read first), zero the ops
+  qword (slot offset +16) of (i) every slot written by
+  `forge_pipe_buffers_on_page` (16 slots at `PIPE_OBJECT_SIZE` stride,
+  base tracked at call time) and (ii) any transient per-op patched slot
+  left dirty by a failed patch/restore (`pipe_phys_read/pipe_phys_write`
+  now track `pipe_forge_slot_dirty`). `free_pipe_info` skips `ops == 0`
+  slots, so its release loop never touches the forged pages. Runs BOTH
+  from `reset_pipe_attempt()` (mid-run teardown between attempts is a
+  reset moment too) and from the atexit handler.
+- **fork-hold** — `pipe_exit_disarm_and_hold()` (single atexit
+  registration in `pipe_exit_protect_install()`, armed at the top of
+  `prepare_pipe_buffer_page`): covers every `exit()` path including all
+  `pr_error`/`SYSCHK` exits; forks a detached child (PDEATHSIG cleared
+  first, setsid, name `rmgexit-hold`, stdio → /dev/null, raw syscalls
+  only — other threads may hold stdio locks) that inherits every fd and
+  sleeps forever, so the parent's `do_exit` never drops the last pipe
+  inode ref and `free_pipe_info` never runs. Success path reuses the
+  existing `spawn_allocation_keeper()` (marked via
+  `pipe_exit_note_holder()`, no double-spawn).
+- Residue (MHL parity): one sleeping holder per attempt, freed on
+  reboot; `_exit()` paths (env-gated diagnostics) and unhandleable signal
+  deaths (supervisor SIGKILL on timeout) skip atexit by design.
+
+### PR #303 tuning adoption (a55x-A556EXXUEDZE4, device-validated)
+
+Delta audit vs our target.h (their kernel 6.1.157 vs our 6.1.138):
+ADOPTED (semantics device-independent; the identical set is already
+field-validated on our e1s targets): `APP_SLIDE_RECLAIM_SENDS 192`,
+`APP_SLIDE_RECLAIM_SNDBUF 16777216`, `APP_MM_LATE_DRAIN_TRIGGERS 2`,
+`APP_DEFER_FINAL_DRAIN_REAP 1`, `APP_DEFER_ALL_DRAIN_REAPS 1`,
+`APP_QUIET_RECLAIM_WINDOW 1`, `APP_FOPS_PSELECT_DELAY_USEC 50000`,
+`SLIDE_PSELECT_TIMEOUT_NSEC 500000000L` (was a 100 ms local choice),
+`SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 8`, `FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 8`,
+`APP_SLIDE_FRESH_PAGE_ATTEMPTS 8`, `APP_FOPS_FRESH_PAGE_ATTEMPTS 8`,
+`APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES 16`,
+`APP_FOPS_KERNEL_PAGE_SEARCH_BATCHES 16`, `DEFAULT_EXPLOIT_ATTEMPTS 1`
+(one long-lived attempt — every attempt exit is a reset-exposure moment),
+`DEFAULT_ATTEMPT_TIMEOUT_SEC 2200`, `DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 1200`.
+NOT adopted, with reasons:
+
+- All derived offsets (`ASHMEM_*`, `CONFIGFS_*`, `INIT_TASK_OFF`,
+  `SLIDE_TRACEFS_WORKER_CALLER_OFF`, `ANON_PIPE_BUF_OPS_OFF`, …),
+  `SKB_DATA_DELTA`, `SLIDE_PSELECT_WORD_SHIFT` (their 3 vs our
+  re-verified 5), `SLIDE_BANK_*` — our 6.1.138 kernel.
+- `APP_REQUIRE_FRESH_P0_SESSION` (+ dead-without-it
+  `APP_DEFAULT_FAST_KSNITCH`): route-semantic gate; the pselect
+  sync/guard complex (`SLIDE_SYNC_PSELECT_SYSCALL`,
+  `SLIDE_GUARD_PSELECT_SYSCALL`, READY/RECHECK timeouts,
+  WCHAN_CONFIRMATIONS, TRIGGER_MAX_AGE, POST_GUARD_AGE_CHECK) is
+  functionally bound to it in our slide_app.c wiring (declarations +
+  wait sites live under that gate) — adopt that pair TOGETHER in a later
+  wave (first cut added them standalone and the build failed on
+  undeclared `guard_wchan`).
+- Production-slot geometry (`APP_PRODUCTION_SLOT_*`,
+  `APP_FOPS_TABLE_MIRROR_OFF`, KERNEL_PAGE_KSNITCH identity partition,
+  FOPS data-alias flags, `P0_ORACLE_PRODUCTION_SLOT`) — their
+  slide8-fops8 route vs our physical-p0-oracle route.
+- Object-index bounds (`APP_SLIDE_MIN/MAX_OBJECT_INDEX`,
+  `APP_FOPS_MIN_OBJECT_INDEX`, `APP_RECLAIM_MAX_DIRECT_BASE`) —
+  measurement-derived on their device/SoC.
+- `KERNELSNITCH_FUTEX_HASH_SIZE`: not pinned — runtime discovery is
+  correct (ksdiag proved 2048 == readback).
+- `KERNELSNITCH_COLLISION_CONFIRMATIONS`: keep OUR 5 (> their 3).
+- `APP_SLIDE_RECLAIM_SENDS` is dead in BOTH trees (defined, never
+  consumed) — kept only for fleet-table parity.
+
+### Build + spot-verify (this wave)
+
+- `make TARGET=a55x-A556EXXSECZDE ANDROID_NDK_HOME=…r28b release`:
+  pre-truncate **94032 B** → margin **10096 B** under the 104128 cap;
+  artifact truncated to 104128 B per recipe. sha256
+  `8dd0c992789139d2d382ff499d2cacc731fda87ad561c5310b60db21af0d5368`.
+- Prior gates re-run on the new ELF: `slide downstream verification
+  armed` rodata string ✓; `prepare_slide_pselect_fdsets` in-function
+  `cmp x22, #0x108` @ 0x12790 with stride `add x22, x22, #0x18` @ 0x127b8
+  (11 × 24 B) ✓; `slide_pselect_global_word` `add w0, w0, #0x5` +
+  waiter-word `add w4, w4, #0x5` @ 0x125cc (shift 5) ✓; variant label ✓;
+  `[ksdiag]` format + `/sys/devices/system/cpu/possible` ✓.
+- NEW-fix evidence: dynsym exports `pipe_exit_disarm_forged_slots`
+  (0xe0), `pipe_exit_protect_install` (0x24), `pipe_exit_note_holder`
+  (0x10); rodata `rmgexit-hold`; per-symbol growth
+  `pipe_phys_read/write` +40 each (dirty tracking), `reset_pipe_attempt`
+  +12 (disarm call), `prepare_pipe_buffer_page` +4 (install),
+  `forge_pipe_buffers_on_page` +8 (ring-base), `run_exploit` +8
+  (keeper note). .text 40780 → 41588 (+808), .rodata 23120 → 23072
+  (−48: drain-log restructure under QUIET_RECLAIM_WINDOW), .bss +32
+  (tracked forge state). Growth confined to the pipe/exit-path +
+  tuning-flag areas as expected.
+- Diff vs prior artifact 3070c89e…8a9f: 74445/104128 bytes differ
+  (expected: code insertions shift everything after .dynstr).

