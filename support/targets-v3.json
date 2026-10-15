@@ -331,20 +331,6 @@
         "url": "https://raw.githubusercontent.com/k2-60/Root-My-Galaxy-Payloads/main/kernelsu/ksud-e3q-S9280ZCS6DZF2-kdp",
         "size": 4879856
       }
-    },
-    {
-      "payloadId": "a55x-A556EXXSDCZB5",
-      "displayName": "Galaxy A55 5G | Kernel 6.1.138",
-      "models": ["SM-A5560", "SM-A556B", "SM-A556E", "SM-A556S", "SM-A556V"],
-      "kernelVersions": ["6.1.138"],
-      "exploit": {
-        "url": "https://raw.githubusercontent.com/k2-60/Root-My-Galaxy-Payloads/main/artifacts/a55x-A556EXXSDCZB5/cve-2026-43499-app.so",
-        "size": 104128
-      },
-      "kernelsu": {
-        "url": "https://raw.githubusercontent.com/k2-60/Root-My-Galaxy-Payloads/main/kernelsu/ksud-a55x-A556EXXSDCZB5-kdp",
-        "size": 4767304
-      }
     }
   ]
 }
