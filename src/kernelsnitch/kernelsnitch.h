@@ -91,6 +91,7 @@ struct kernelsnitch_shared_state {
     pthread_t *increase_tids;
     size_t increase_count;
     size_t increase_id;
+    volatile size_t probe_count;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
     size_t identity_start;
     size_t identity_end;
@@ -231,6 +232,7 @@ static void *__mm_leak(void *arg)
     struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)arg;
     struct kernelsnitch_shared_state *ks = mm_leak_arg->ks;
     struct range *range = &mm_leak_arg->range;
+    size_t probes = 0;
     if (ks->verbose) pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start, range->end);
     size_t mm_slab_sz = KS_PAGE_SIZE << ks->mm_slab_order;
     for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
@@ -258,6 +260,7 @@ static void *__mm_leak(void *arg)
 #endif
 
                 size_t found_hash = 1;
+                probes++;
                 if (!ks->mte_enabled) {
                     // test the mm_struct candidate
                     for (size_t i = 1; i < ks->collisions && found_hash; ++i)
@@ -293,6 +296,7 @@ static void *__mm_leak(void *arg)
             }
         }
     }
+    ks->probe_count += probes;
     free(mm_leak_arg);
     return 0;
 }
@@ -325,6 +329,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
     ks->appended_futexes = APPENDED_FUTEXES;
     ks->repeat_measurement = REPEAT_MEASUREMENT;
     ks->average = AVERAGE;
+    ks->probe_count = 0;
 
     // unfortunately I have to use a the kernelsnitch_shared_state and mmap(shared) as find collisions and bruteforce might be in different processes!!!
     ks->futex_hash_table_size = 256*ks->cpu_cnt;
@@ -506,6 +511,20 @@ size_t kernelsnitch_found_collisions(struct kernelsnitch_shared_state *ks)
     return ks->state == KERNELSNITCH_COLLISIONS_FOUND;
 }
 
+static void __ksdiag_read_cpu_mask(const char *path, char *buf, size_t sz)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return;
+    ssize_t n = read(fd, buf, sz - 1);
+    close(fd);
+    if (n > 0) {
+        buf[n] = '\0';
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+            buf[--n] = '\0';
+    }
+}
+
 /**
  * Brute-forcing phase, where it tests all mm_struct candidates and matches the hash collisions for this current candidate with the observed user space futex addresses
  * @arg ks: shared KernelSnitch state
@@ -577,6 +596,30 @@ void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
     for (size_t i = 0; i < ks->thread_cnt; ++i)
         if (ks->tids[i])
             pthread_join(ks->tids[i], 0);
+    if (ks->mm_struct == (size_t)-1) {
+        char pbuf[48] = "?", obuf[48] = "?";
+        unsigned long k_hs = 0, r = 1;
+        size_t app_hs = 1;
+        size_t onln = (size_t)sysconf(_SC_NPROCESSORS_ONLN);
+        __ksdiag_read_cpu_mask("/sys/devices/system/cpu/possible", pbuf, sizeof(pbuf));
+        __ksdiag_read_cpu_mask("/sys/devices/system/cpu/online", obuf, sizeof(obuf));
+        const char *sep = strrchr(pbuf, '-');
+        if (!sep)
+            sep = strrchr(pbuf, ',');
+        if (sep) {
+            k_hs = 256 * (strtoul(sep + 1, 0, 0) + 1);
+            while (r < k_hs)
+                r <<= 1;
+            k_hs = r;
+        }
+        while (app_hs < onln * 256)
+            app_hs <<= 1;
+        pr_info("[ksdiag] mm-not-found collisions=%zu appended=%zu probes=%zu "
+                "app_hashsize=%zu kernel_hashsize=%lu conf=%ld onln=%zu "
+                "possible=%s online=%s\n",
+                ks->collisions - 1, ks->appended_futexes, ks->probe_count,
+                app_hs, k_hs, sysconf(_SC_NPROCESSORS_CONF), onln, pbuf, obuf);
+    }
     ks->state = (ks->mm_struct == (size_t)-1) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
 }
 

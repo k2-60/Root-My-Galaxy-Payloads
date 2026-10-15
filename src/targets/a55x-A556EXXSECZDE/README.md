@@ -137,6 +137,70 @@ reproduces the shipped artifact sha exactly):
   merge; all other strings identical in content and order), and the
   adrp/add immediates referencing the moved string. No logic changes.
 
+## Instrumented ksdiag build (2026-10-15 — supersedes the fcfc8800… build)
+
+Rationale: the phase2-ww KernelSnitch leak analysis
+(`/media/k3nt/Data/4aDEV/a55-firmware/phase2-ww/leak/leak-analysis.md`)
+concluded that the `pipe KernelSnitch sk_buff page leak failed` print
+(pipe.c:206-207) fires when the offline futex-hash inversion
+(`kernelsnitch_bruteforce`) finds no mm_struct candidate after collisions
+were found; top hypothesis **H3 = timing-oracle noise**, possibly
+aggravated by the app's futex-hashsize **model mismatch** (app:
+`sysconf(_SC_NPROCESSORS_ONLN)*256`, unrounded — futex_hash.h `futex_init`;
+kernel: `roundup_pow2(256 × cpumask_weight(__cpu_possible_mask))`). This
+build adds failure-path diagnostics and applies the recommended retuning.
+Recommended action from the analysis: diagnostics + tuning only; no exploit
+logic change.
+
+- TUNING (target.h): `SLIDE_KSNITCH_APPENDED_FUTEXES 2048→4096`;
+  `KERNELSNITCH_THRESHOLD_MULT 10→15` and
+  `KERNELSNITCH_COLLISION_CONFIRMATIONS 3→5` (these live as `#ifndef`
+  defaults in kernelsnitch.h:413-417; now pinned from target.h, which
+  common.h→offset.h includes before kernelsnitch.h in the only TU that
+  compiles it — util.c). Note: the `RMG_KSNITCH_*` env knobs are dead on
+  this build — `configure_kernelsnitch_profile` (util.c:49-97) only runs in
+  the `APP_REQUIRE_FRESH_P0_SESSION` branch; CZDE takes the P0-oracle
+  branch, where `setup_kernelsnitch` calls `kernelsnitch_set_profile`
+  directly with the target.h constants (util.c:452-457).
+- DIAGNOSTICS (kernelsnitch/kernelsnitch.h, failure path only): after the
+  bruteforce join, when no mm_struct candidate was found, one greppable
+  line is printed:
+  `[ksdiag] mm-not-found collisions=<found> appended=<4096> probes=<candidates-tested> app_hashsize=<roundup_pow2(ONLN×256)> kernel_hashsize=<roundup_pow2(256×possible-max+1)> conf=<sysconf CONF> onln=<sysconf ONLN> possible=<mask> online=<mask>`
+  — the kernel model is derived by reading
+  `/sys/devices/system/cpu/possible` (+ `/online`) at runtime; the probe
+  counter is a new `probe_count` field in `kernelsnitch_shared_state`
+  accumulated per candidate in `__mm_leak` (per-thread local, summed after
+  join — no timing impact on the probe loop). No pipe.c/util.c changes: the
+  pipe.c failure print runs after `kernelsnitch_cleanup()` already munmap'd
+  the state, so the diagnostics live at the kernelsnitch.h post-inversion
+  point (state still mapped). There is no probe-slow counter in the code —
+  per the analysis instruction none was invented.
+
+Build record (same pipeline):
+
+```text
+pre-truncate size: 92936 (assert ≤ 104128 PASS → zero-pad to 104128; margin 11192 B)
+SHA-256: 3070c89e9512a76dd93e8ab5a52ec2cee2e06d896f9ef916df4982555b8f8a9f
+```
+
+Binary spot-verify on this build (llvm-objdump on the pre-truncate ELF):
+
+- `[ksdiag]` format string and `/sys/devices/system/cpu/possible` +
+  `/online` strings present → PASS.
+- Prior gates intact: rodata `slide downstream verification armed` present;
+  shift-5 add `add w4, w4, #0x5` @ 0x124e4 (`slide_pselect_put_waiter_word`);
+  11-word fdset `cmp x22, #0x108` @ 0x126a8 (stride `#0x18`,
+  `words_per_set=5` immediate `mov w3, #0x5` @ 0x126c8); embedded label
+  `a55x-A556EXXSECZDE-app-physical-p0-oracle` → ALL PASS.
+- Tuning constants compiled in: `setup_kernelsnitch` @ 0x10358 inlines
+  `kernelsnitch_set_profile` — stores the rodata pool @ 0xa070
+  (`0000000000001000 0000000000000040` = appended **4096** + repeat 64)
+  via `str q0, [x0, #0x40]` and `mov w8, #0x8` → average 8 via
+  `str x8, [x0, #0x50]`; `kernelsnitch_find_collisions` computes the
+  threshold as `lsl x8, x20, #4; sub x22, x8, x20` = approx×
+  **15** @ 0xf8d8/0xf8ec (was ×10) and bounds the confirmation loop with
+  `mov w28, #0x5` countdown @ 0xf93c (was 3) → PASS.
+
 ## KernelSU carry-over (KO gates re-run against the CZDE ELF)
 
 The CZDE kernel recovery gates re-run on the Phase 3 KO
