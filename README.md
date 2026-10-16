@@ -99,5 +99,9 @@ The SM-A536E GZG3 device validation is in
 [`docs/SM-A536E-A536EXXSNGZG3.md`](docs/SM-A536E-A536EXXSNGZG3.md).
 The SM-S9280 China (CHC) DZF2 port and validation record is in
 [`docs/SM-S9280-S9280ZCS6DZF2.md`](docs/SM-S9280-S9280ZCS6DZF2.md).
+The SM-A556E CZDE retarget and its `fs.pipe-user-pages-soft=8192` pipe-budget
+campaign record (drain pipes stay at creation size; reclaim-only 26-slot
+floor growth) is in
+[`docs/SM-A556E-A556EXXSECZDE.md`](docs/SM-A556E-A556EXXSECZDE.md).
 
 Use only on devices you own or are explicitly authorized to test.

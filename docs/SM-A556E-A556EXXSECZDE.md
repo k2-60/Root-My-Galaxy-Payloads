@@ -186,3 +186,61 @@ removed the stale CZB5 entry):
   }
 }
 ```
+
+## Pipe budget — `fs.pipe-user-pages-soft` = 8192 (campaigns 13/15/16)
+
+`F_SETPIPE_SZ` growth is charged per-real-uid against
+`fs.pipe-user-pages-soft`. CZDE enforces **L = 8,192 slots** (Samsung
+hardening; A54 stock is 16,384, which is why the a54-fork arsenal
+480×32 = 15,360 fits there and the release-hygiene pattern was born on
+that device).
+
+Every CZDE pass/fail on boot `ffffff80022f2e38` (c9 through try16 all
+share it) fits L = 8,192:
+
+- try12 attempt 4 (6808387 build, SYSCHK era): the first
+  `F_SETPIPE_SZ` EPERM of the shell-uid campaigns. Fits the crossing
+  exactly: with the 240 drain rings grown 2→32 the pool sits at
+  8,160–8,190 ≤ 8,192 and the next +30-slot growth crosses to 8,220
+  (reclaim ring 1, if the three prior attempts leaked ~nothing) or the
+  equivalent drain-ring crossing under ~976 slot-units/attempt of hold
+  residue — either way the wall is L = 8,192.
+- try13/15/16 (9db6c33/ddd5d51 builds): failed attempts leave hold
+  processes (the sleeping prepare child plus the exit fork-hold keep the
+  attempt's pipe arsenal — roughly 500–1,000 slot-units — alive) and
+  that residue accumulated past L on the shared boot, so every
+  growth-reaching attempt died on the FIRST drain resize:
+  `pipe ring resize failed want=26 bytes=106496 errno=1` +
+  `p0 pipe ring alloc failed drain=0`. try16's `[pipefix]` probe made
+  the verdict definitive: probe16 EPERM **and probe3 (+1 slot) EPERM at
+  `this-process-pipe-slots=960`** — a +1-slot growth denial only makes
+  sense against an already-exhausted per-uid pool, i.e. budget, not the
+  `fs/pipe-max-size` sysctl (unreadable to uid 2000, errno 13).
+
+The fix: the **drain pipes stay at their creation size (2 slots)** and
+never resize — on CZDE a drain growth is a pure budget spend — and only
+the reclaim/oracle rings resize. They request 32 slots (960 + 240×30 =
+8,160 ≤ 8,192 on a clean boot) and keep the 9db6c33 floor-26 cap as the
+safety net: worst case 960 + 240×26 = **6,720 ≤ 8,192** (margin 1,472),
+ring array 26×0x28 = 1,040 B still inside the kmalloc-2k bucket
+(static assert from 9db6c33 unchanged). A one-time
+`[pipefix] plan drain=240×2 reclaim=240×26 total=6720 (budget model
+L=8192)` line logs the plan at pipeline start; the `[pipefix]` wall
+probe is unchanged.
+
+Residue note: the plan guarantees a FRESH-BOOT run. Hold residue from
+failed attempts keeps accumulating on a booted device and pushes later
+attempts past L regardless of pipeline shape — reboot between campaigns.
+
+Build record (this commit): pre-truncate 97,024 B (margin 7,104 against
+the 104,128 cap), artifact
+`artifacts/a55x-A556EXXSECZDE/cve-2026-43499-app.so` sha256
+`0bdc2eaf8704ea949a6a4b497d15bd904c346ea24f824929ddf14502a10b379f`.
+Spot-verify re-run on the new ELF: `cmp x22, #0x108` (11-word loop
+bound) 1×, `add w4, w4, #0x5` (shift 5) 1×, rodata
+`slide downstream verification armed`, label
+`a55x-A556EXXSECZDE-app-physical-p0-oracle`, `[ksdiag]` strings,
+`[pipefix] pipe wall` probe strings, both `pipe ring resize capped`
+variants, the new plan-line string — all present; the drain-growth
+failure string `p0 pipe ring alloc failed drain=` is ABSENT (the growth
+loop is gone).
