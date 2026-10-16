@@ -164,6 +164,111 @@ static size_t pipe_sysctl_max_slots(void) {
   return pipe_ring_limit_slots;
 }
 
+/* [pipefix] one-shot wall discriminator (campaign 16): fired once, at the
+ * first F_SETPIPE_SZ EPERM that survives the geometry floor. Distinguishes
+ * the fs/pipe-max-size sysctl cap from per-uid soft-budget exhaustion:
+ *  - fs/pipe-max-size readable and below the 26-slot floor -> the cap is
+ *    the sysctl itself (immutable from uid 2000; no release hygiene helps).
+ *  - otherwise probe a fresh pipe at 16 slots (65,536 B, the smallest
+ *    useful ring): growth succeeding while the 26-slot request failed
+ *    means the per-uid budget is the wall and the a54-fork release
+ *    hygiene is the fix; with the sysctl readable at >= the floor, even a
+ *    probe16 EPERM is budget (the sysctl cannot block a 65,536-B ring
+ *    under a >= 106,496-B cap). Only when the sysctl is unreadable does a
+ *    probe16 EPERM fall back to the sysctl-cap verdict. */
+static int pipe_wall_probe_done;
+
+static size_t pipe_held_slots_estimate(void) {
+  size_t total = 0;
+  size_t i;
+
+  for (i = 0; i < PIPE_DRAIN; i++) {
+    if (pipe_fds_drain[i][0] >= 0) {
+      long ring = fcntl(pipe_fds_drain[i][0], F_GETPIPE_SZ);
+      if (ring > 0) {
+        total += (size_t)ring / PAGE_SIZE;
+      }
+    }
+  }
+  for (i = 0; i < PIPE_RECLAIM; i++) {
+    if (pipe_fds_reclaim[i][0] >= 0) {
+      long ring = fcntl(pipe_fds_reclaim[i][0], F_GETPIPE_SZ);
+      if (ring > 0) {
+        total += (size_t)ring / PAGE_SIZE;
+      }
+    }
+  }
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+  for (i = 0; i < PIPE_RECLAIM; i++) {
+    if (p0_gate_holders[i][0] >= 0) {
+      long ring = fcntl(p0_gate_holders[i][0], F_GETPIPE_SZ);
+      if (ring > 0) {
+        total += (size_t)ring / PAGE_SIZE;
+      }
+    }
+  }
+#endif
+  return total;
+}
+
+static void pipe_wall_diagnose(size_t want, int saved_errno) {
+  size_t cap;
+  size_t held;
+  int probe[2];
+
+  if (pipe_wall_probe_done) {
+    return;
+  }
+  pipe_wall_probe_done = 1;
+
+  cap = pipe_sysctl_max_slots();
+  held = pipe_held_slots_estimate();
+  if (cap && cap < P0_PIPE_RING_MIN_SLOTS) {
+    pr_warning("[pipefix] pipe wall: sysctl cap (fs/pipe-max-size slots=%zu "
+               "below floor %d; this-process-pipe-slots=%zu want=%zu "
+               "errno=%d)\n", cap, (int)P0_PIPE_RING_MIN_SLOTS, held, want,
+               saved_errno);
+    return;
+  }
+  if (pipe2(probe, O_CLOEXEC | O_NONBLOCK) != 0) {
+    pr_warning("[pipefix] pipe wall probe pipe failed errno=%d (want=%zu "
+               "errno=%d)\n", errno, want, saved_errno);
+    return;
+  }
+  /* normalize the fresh 16-slot ring down to 2 so the probe growth below
+   * is a real charged resize, not a same-size no-op */
+  fcntl(probe[0], F_SETPIPE_SZ, (long)(2 * PAGE_SIZE));
+  errno = 0;
+  if (fcntl(probe[0], F_SETPIPE_SZ, (long)(16 * PAGE_SIZE)) >= 0) {
+    pr_warning("[pipefix] pipe wall: budget — arsenal release should fix "
+               "(probe16=ok this-process-pipe-slots=%zu want=%zu errno=%d)\n",
+               held, want, saved_errno);
+  } else {
+    int e16 = errno;
+    int e3 = 0;
+    int probe3 = fcntl(probe[0], F_SETPIPE_SZ, (long)(3 * PAGE_SIZE));
+    if (probe3 < 0) {
+      e3 = errno;
+    }
+    if (cap) {
+      /* sysctl >= floor but a 65,536-B ring still EPERMs: budget */
+      pr_warning("[pipefix] pipe wall: budget — arsenal release should fix "
+                 "(probe16=EPERM errno=%d probe3=%s errno=%d "
+                 "this-process-pipe-slots=%zu cap=%zu want=%zu errno=%d)\n",
+                 e16, probe3 >= 0 ? "ok" : "EPERM", e3, held, cap, want,
+                 saved_errno);
+    } else {
+      /* sysctl unreadable: fall back to the probe16 heuristic */
+      pr_warning("[pipefix] pipe wall: sysctl cap (probe16=EPERM errno=%d "
+                 "probe3=%s errno=%d this-process-pipe-slots=%zu want=%zu "
+                 "errno=%d)\n", e16, probe3 >= 0 ? "ok" : "EPERM", e3, held,
+                 want, saved_errno);
+    }
+  }
+  close(probe[0]);
+  close(probe[1]);
+}
+
 int resize_pipe_slots(int pipefd[2], size_t slots) {
   size_t want = slots;
   size_t limit;
@@ -176,6 +281,9 @@ int resize_pipe_slots(int pipefd[2], size_t slots) {
     }
     saved_errno = errno;
     if (saved_errno != EPERM || want <= P0_PIPE_RING_MIN_SLOTS) {
+      if (saved_errno == EPERM) {
+        pipe_wall_diagnose(want, saved_errno);
+      }
       pr_warning("pipe ring resize failed want=%zu bytes=%zu errno=%d\n",
                  want, want * PAGE_SIZE, saved_errno);
       return -1;
@@ -204,8 +312,8 @@ int make_pipe_object(int pipefd[2]) {
   return resize_pipe_slots(pipefd, 2);
 }
 
-int alloc_pipe_object(int pipefd[2]) {
-  size_t want = PIPE_BUFFER_SLOTS;
+int alloc_pipe_object_slots(int pipefd[2], size_t slots) {
+  size_t want = slots;
   size_t limit;
   long ring;
 
@@ -230,6 +338,10 @@ int alloc_pipe_object(int pipefd[2]) {
     }
   }
   return 0;
+}
+
+int alloc_pipe_object(int pipefd[2]) {
+  return alloc_pipe_object_slots(pipefd, PIPE_BUFFER_SLOTS);
 }
 
 void free_pipe_object(int pipefd[2]) {
@@ -350,7 +462,17 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
 #endif
 
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
-    if (alloc_pipe_object(pipe_fds_drain[i]) != 0) {
+    /* budget hygiene before the oracle-canvas resize (a54-fork main.c:454-465
+     * pattern): F_SETPIPE_SZ growth is charged per-real-uid against
+     * fs.pipe-user-pages-soft, and the 240 drain rings at 32 slots hold
+     * 7,680 slot-units the reclaim growth below still needs. The drain
+     * pipes carry no data and are never forged — their only job is the
+     * kmalloc-2k ring-array slab shape, which the 26-slot floor preserves
+     * (26 x 0x28 = 1040 B, same bucket) — so growing them at the floor
+     * hands 1,440 slot-units back to the per-uid pool right before the
+     * reclaim rings (the oracle canvas) resize. */
+    if (alloc_pipe_object_slots(pipe_fds_drain[i],
+                                P0_PIPE_RING_MIN_SLOTS) != 0) {
       /* no pr_error here: it is exit(-1), and an exit inside this prepare
        * child leaves the fork-hold holding result_pipe[1] so the parent
        * blocks on read() until the attempt timeout — warning + the same
