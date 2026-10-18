@@ -167,5 +167,35 @@ Kept from the CZDE wave: compact `rt_mutex_waiter` (BTF confirms 0x58),
 `APP_ACCEPT_SCHED_TRIGGER`, `SLIDE_KSNITCH_*` tuning, pipe budget-cap
 logic, arsenal release, fops/UMH layout 0x7000/0x7800/0x7a00.
 
-The support-feed retarget (payload id, `kernelVersions` 6.1.157, artifact
-sizes) and the KernelSU KO/ksud pair belong to the separate KO wave.
+## KernelSU pair (KO wave — rebuilt for 6.1.157)
+
+The CZDE KO carried over only after gates; UEDZE4 changes the kernel
+release (6.1.138 -> 6.1.157) and the export surface, so the module was
+rebuilt in the DDK (`ghcr.io/ylarod/ddk-min:android14-6.1-20260313`,
+digest `1dd6ac34…d5d3`) with the release rewritten to
+`6.1.157-android14-11`, `CONFIG_KSU=m`, KDP/RKP/DEFEX/NO_PATCH_TEXT all
+`y`, and `KCFLAGS=-DCONFIG_DEBUG_INFO_BTF_MODULES=1`.
+
+Gates against `uedze4/symbols/vmlinux.elf` (all PASS):
+
+```text
+vermagic: 6.1.157-android14-11 SMP preempt mod_unload modversions aarch64 (byte-exact)
+check_symbol: (no output) EXIT=0
+__versions: size 0; .symtab/.strtab present
+target symvers: wrote 15450 exact target CRCs
+audit: missing 0, version entries 0, CRC mismatches 0, kallsyms-resolved 47
+```
+
+Artifacts (feed pair):
+
+```text
+kernelsu/android14-6.1_kernelsu-a55x-A556EXXUEDZE4-kdp.ko
+  398336 B, sha256 824f2af93a5d520ace0dd13f4f0cf8c1cc7b985b81872fa7fc5b194c6cbb1698
+kernelsu/ksud-a55x-A556EXXUEDZE4-kdp
+  4767304 B, sha256 1a602a84baa4831ea203d69d23852c05461f60b21c351c6ebc4ef8771ba7a5f3
+  (embeds the new KO: exact libflate stream at offset 74240, full match)
+```
+
+The support-feed retarget is live in `support/targets-v3.json` (entry
+`a55x-A556EXXUEDZE4`, `kernelVersions: ["6.1.157"]`, exploit 104128 B,
+ksud 4767304 B). Full build/gate record: `docs/SM-A556E-A556EXXUEDZE4.md`.
