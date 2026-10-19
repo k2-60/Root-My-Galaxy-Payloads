@@ -93,7 +93,7 @@
 #define APP_SLIDE_WINDOW_PIPE 1
 /* Reject non-fresh mm candidates below PR #303's device-validated UEDZE4
  * partition; index 22 means the slab was not fully reclaimed (gatemiss §3). */
-#define APP_SLIDE_MIN_OBJECT_INDEX 0
+#define APP_SLIDE_MIN_OBJECT_INDEX 2
 /* Bound fresh-page gate retries on a reclaim or window miss. */
 #define APP_SLIDE_GATE_ATTEMPTS 3
 #define SLIDE_KSNITCH_APPENDED_FUTEXES 4096
