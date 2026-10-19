@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <err.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sched.h>
@@ -35,6 +36,32 @@
 #define COLOR_RED "\033[31m"
 #define COLOR_YELLOW "\033[33m"
 #define COLOR_DEFAULT "\033[0m"
+
+#define RMG_LIVE_LOG_PATH "/data/local/tmp/rmg-live.log"
+
+extern FILE *rmg_live_log;
+
+static inline void rmg_live_log_init(void)
+{
+    if (!rmg_live_log)
+        rmg_live_log = fopen(RMG_LIVE_LOG_PATH, "a");
+}
+
+static inline void rmg_log_emit(const char *fmt, ...)
+{
+    va_list ap;
+    va_list mirror;
+    va_start(ap, fmt);
+    if (rmg_live_log)
+        va_copy(mirror, ap);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    if (rmg_live_log) {
+        vfprintf(rmg_live_log, fmt, mirror);
+        va_end(mirror);
+        fflush(rmg_live_log);
+    }
+}
 
 #define SYSCHK(x) ({ \
         typeof(x) __res = (x); \
@@ -81,17 +108,17 @@
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
-        printf(COLOR_RED "[!] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_RED "[!] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
-        printf(COLOR_RED "[-] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_RED "[-] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
-        printf(COLOR_YELLOW "[*] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_YELLOW "[*] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
-        printf(COLOR_GREEN "[+] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_GREEN "[+] %s:%d " COLOR_DEFAULT fmt, __FILE__, __LINE__, ##__VA_ARGS__); \
     } while (0)
 #endif
 #else
@@ -111,17 +138,17 @@
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
-        printf(COLOR_RED "[!] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_RED "[!] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
 #define pr_warning(fmt, ...) do { \
-        printf(COLOR_RED "[-] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_RED "[-] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_info(fmt, ...) do { \
-        printf(COLOR_YELLOW "[*] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_YELLOW "[*] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
     } while (0)
 #define pr_success(fmt, ...) do { \
-        printf(COLOR_GREEN "[+] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        rmg_log_emit(COLOR_GREEN "[+] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
     } while (0)
 #endif
 #endif

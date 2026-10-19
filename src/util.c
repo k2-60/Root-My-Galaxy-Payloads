@@ -1,6 +1,8 @@
 #include "common.h"
 #include "kernelsnitch/kernelsnitch.h"
 
+FILE *rmg_live_log;
+
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
 static unsigned char *skb_buf;

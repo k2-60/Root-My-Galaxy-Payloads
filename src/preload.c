@@ -123,6 +123,7 @@ __attribute__((constructor)) static void load(void) {
     return;
   }
   started = 1;
+  rmg_live_log_init();
   set_unbuffer();
   wait_for_boot_quiet_window();
 
