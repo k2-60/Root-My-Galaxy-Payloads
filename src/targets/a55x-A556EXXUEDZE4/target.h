@@ -91,15 +91,9 @@
  * (analysis gatemiss §0.4/§5.2.3).  The window pipe replaces the timerfd,
  * which could only expire (ret=0) and never armed the window. */
 #define APP_SLIDE_WINDOW_PIPE 1
-/* Campaign 20 (objindex findings §3): PR #303's 27..30 is their KernelSnitch
- * *search window* in fresh-session mode, not a validity rule for our
- * non-fresh route.  Our scan covers all 32 slots; SLAB_FREELIST_RANDOM
- * randomises placement, so valid leaks land at any index (campaign 20 saw
- * 2/12/17; campaign 19's 22 ran the full chain).  The post-write gate
- * readback + retries are the validity test.  MIN-27 deleted; the fresh-path
- * search bounds remain gated on APP_REQUIRE_FRESH_P0_SESSION.
- * #define APP_SLIDE_MIN_OBJECT_INDEX 27
- */
+/* Reject non-fresh mm candidates below PR #303's device-validated UEDZE4
+ * partition; index 22 means the slab was not fully reclaimed (gatemiss §3). */
+#define APP_SLIDE_MIN_OBJECT_INDEX 0
 /* Bound fresh-page gate retries on a reclaim or window miss. */
 #define APP_SLIDE_GATE_ATTEMPTS 3
 #define SLIDE_KSNITCH_APPENDED_FUTEXES 4096
