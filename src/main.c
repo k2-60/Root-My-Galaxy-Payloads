@@ -431,6 +431,7 @@ int run_exploit(int argc, char **argv) {
   (void)argc;
   (void)argv;
 
+  setvbuf(stdout, NULL, _IONBF, 0);
   disable_rseq_for_thread();
   set_limit();
   log_startup_context();
