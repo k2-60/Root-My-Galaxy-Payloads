@@ -18,6 +18,12 @@ endif
 ifeq ($(TARGET),gts9-X710XXS6EZF1)
 APP_TARGET_CFLAGS := -DSLIDE_STACK_WRITER=1
 endif
+# Campaign 32: the fops-first/controlled-reclaim route pushes the release to
+# 105216 B without this; the flag is already used by the stable build and
+# restores margin (102968 B) without changing the payload entry (constructor).
+ifeq ($(TARGET),a55x-A556EXXUEDZE4)
+APP_TARGET_CFLAGS += -fno-semantic-interposition
+endif
 ifeq ($(TARGET),a53x-A536EXXSNGZG3)
 API := 31
 endif
