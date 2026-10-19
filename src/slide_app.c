@@ -705,6 +705,24 @@ static useconds_t slide_enter_delay_usec(void) {
 static void slide_wait_before_consume(int sequence) {
   if (sequence == 1) {
     useconds_t delay = slide_enter_delay_usec();
+#if defined(APP_SLIDE_WINDOW_PIPE) && APP_SLIDE_WINDOW_PIPE && \
+    defined(SLIDE_PSELECT_TIMEOUT_NSEC)
+    /*
+     * The window pipe needs the sched_setattr -> byte kick to land while the
+     * waiter is still inside pselect.  The env delay is shared with the fops
+     * route and can be as large as the pselect window itself (campaign 27:
+     * the kick landed after the full 500 ms timeout).  Bound the pre-sched
+     * wait to a quarter of the window so the kick always fires inside it.
+     */
+    useconds_t latest =
+        (useconds_t)(SLIDE_PSELECT_TIMEOUT_NSEC / 1000LL / 4);
+    if (delay > latest) {
+      delay = latest;
+    }
+    if (delay < 5000) {
+      delay = 5000;
+    }
+#endif
     if (delay) {
       usleep(delay);
     }
