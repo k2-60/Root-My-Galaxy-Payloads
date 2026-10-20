@@ -123,6 +123,7 @@
 #define APP_FOPS_FRESH_PAGE_ATTEMPTS 8
 #define APP_FOPS_KERNEL_PAGE_SEARCH_BATCHES 16
 #define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 8
+#define PIPE_FIRST_LEAK_ATTEMPTS 3
 /* one long-lived attempt instead of many short ones: every attempt exit is
  * a teardown/reset exposure moment (field evidence 3x download mode) */
 #define DEFAULT_EXPLOIT_ATTEMPTS 1
