@@ -444,6 +444,15 @@ uintptr_t prepare_pipe_buffer_page_child(void);
 uintptr_t prepare_pipe_buffer_page(void);
 int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
                                 int *chosen_fds);
+struct controlled_mm_drain_state {
+  int *triggers;
+  size_t trigger_count;
+  int s2;
+};
+int drain_controlled_mm_group(int *target_fds,
+                              struct controlled_mm_drain_state *state,
+                              int shaping_sv[2]);
+void release_controlled_mm_drain(struct controlled_mm_drain_state *state);
 void reset_pipe_attempt(void);
 void pipe_exit_protect_install(void);
 void pipe_exit_disarm_forged_slots(void);

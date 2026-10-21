@@ -1320,14 +1320,7 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
   return result;
 }
 
-struct controlled_mm_drain_state {
-  int *triggers;
-  size_t trigger_count;
-  int s2;
-};
-
-static void release_controlled_mm_drain(
-    struct controlled_mm_drain_state *state) {
+void release_controlled_mm_drain(struct controlled_mm_drain_state *state) {
   size_t closed = 0;
 
   pin_to_core(CORE);
@@ -1351,9 +1344,9 @@ static void release_controlled_mm_drain(
           closed, sched_getcpu());
 }
 
-static int drain_controlled_mm_group(
-    int *target_fds, struct controlled_mm_drain_state *state,
-    int shaping_sv[2]) {
+int drain_controlled_mm_group(int *target_fds,
+                              struct controlled_mm_drain_state *state,
+                              int shaping_sv[2]) {
   const size_t batch = ORDER3_SIZE / MM_STRUCT_SZ;
   const size_t trigger_refs = S918_TRIGGER_SLABS * batch;
 
