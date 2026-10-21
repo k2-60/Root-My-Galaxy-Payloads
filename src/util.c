@@ -1177,8 +1177,8 @@ static int controlled_mm_leak(size_t cpu_count, uintptr_t hint,
 #endif
 }
 
-static int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
-                                       int *chosen_fds) {
+int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
+                                int *chosen_fds) {
   const size_t batch = ORDER3_SIZE / MM_STRUCT_SZ;
   const size_t max_groups = 64;
   const size_t opaque_capacity = S918_PAGE_SCAN_MAX * batch;

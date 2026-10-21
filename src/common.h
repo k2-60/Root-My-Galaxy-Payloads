@@ -442,6 +442,8 @@ int alloc_pipe_object(int pipefd[2]);
 void free_pipe_object(int pipefd[2]);
 uintptr_t prepare_pipe_buffer_page_child(void);
 uintptr_t prepare_pipe_buffer_page(void);
+int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
+                                int *chosen_fds);
 void reset_pipe_attempt(void);
 void pipe_exit_protect_install(void);
 void pipe_exit_disarm_forged_slots(void);
