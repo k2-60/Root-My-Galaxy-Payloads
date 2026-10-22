@@ -68,6 +68,12 @@
  * drops to 4 because wanted = collisions-1 = 3 is what this device has been
  * measured to produce, where the dm1q value of 5 demands 4 and cannot pass. */
 #define S918_PAGE_SCAN_MAX 256
+/* Cap one collect() cycle below the absolute ceiling so a pathological scan
+ * returns to the outer retry (which now runs at most two cycles) instead of
+ * churning through all 256 attempts. */
+#define S918_PAGE_SCAN_CYCLE_ATTEMPTS 128
+/* Abandon a hint that keeps re-matching the same already-seen slot. */
+#define S918_DUP_STREAK_MAX 8
 #define S918_KSNITCH_HINT_COLLISIONS 2
 #define S918_KSNITCH_FULL_COLLISIONS 4
 #define S918_KSNITCH_APPENDED_FUTEXES 4096
@@ -122,7 +128,8 @@
 #define APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES 16
 #define APP_FOPS_FRESH_PAGE_ATTEMPTS 8
 #define APP_FOPS_KERNEL_PAGE_SEARCH_BATCHES 16
-#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 8
+/* Two scan cycles bound the controlled search to the app budget. */
+#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 2
 #define PIPE_FIRST_LEAK_ATTEMPTS 3
 /* one long-lived attempt instead of many short ones: every attempt exit is
  * a teardown/reset exposure moment (field evidence 3x download mode) */
