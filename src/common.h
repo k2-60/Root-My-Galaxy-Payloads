@@ -461,7 +461,6 @@ uintptr_t direct_to_page(uintptr_t addr);
 uintptr_t direct_to_head_page(int fd, uintptr_t addr);
 uintptr_t page_to_direct(uintptr_t page);
 uintptr_t pipe_buf_ops_addr(void);
-uintptr_t find_active_pipe_slab_page(int fd);
 int pipe_cache_matches(uint64_t slab_cache);
 int pipe_reclaim_cache_gate(int fd);
 int read_pipe_slab(int fd, uintptr_t base, unsigned char *slab);

