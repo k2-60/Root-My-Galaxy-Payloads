@@ -337,13 +337,14 @@
       "displayName": "Galaxy A55 5G | Kernel 6.1.157 (UEDZE4)",
       "models": ["SM-A556E"],
       "kernelVersions": ["6.1.157"],
+      "requiresFreshP0Session": true,
       "exploit": {
         "url": "https://raw.githubusercontent.com/k2-60/Root-My-Galaxy-Payloads/main/artifacts/a55x-A556EXXUEDZE4/cve-2026-43499-app.so",
         "size": 104128
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/k2-60/Root-My-Galaxy-Payloads/main/kernelsu/ksud-a55x-A556EXXUEDZE4-kdp",
-        "size": 4767304
+        "size": 4780056
       }
     }
   ]
